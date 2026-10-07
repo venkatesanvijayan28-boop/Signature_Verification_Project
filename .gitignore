@@ -1,0 +1,20 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Large model weights (>100 MB exceeds GitHub push limit)
+*.keras
+*.h5
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+
+# System / IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
