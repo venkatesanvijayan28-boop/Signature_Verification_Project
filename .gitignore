@@ -1,19 +1,29 @@
-# Python cache
+# Byte-compiled / optimized files
 __pycache__/
 *.py[cod]
 *$py.class
 
-# Large model weights (>100 MB exceeds GitHub push limit)
+# Large trained models (>100 MB exceeds GitHub limit)
 *.keras
 *.h5
 
-# Virtual Environment
+# Dataset and preprocessed data arrays
+dataset/
+*.npy
+X_data.npy
+y_labels.npy
+
+# Virtual Environments
 .venv/
 venv/
 ENV/
 env/
 
-# System / IDE
+# Streamlit secrets and local caches
+.streamlit/secrets.toml
+.model_cache/
+
+# IDE and OS files
 .vscode/
 .idea/
 *.swp

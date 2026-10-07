@@ -1,10 +1,17 @@
+import os
+import tempfile
+import urllib.request
 import cv2
 import numpy as np
+import requests
 import keras
 from keras import layers
 import streamlit as st
-import tempfile
-import os
+
+# =============================
+# Streamlit Page Configuration
+# =============================
+st.set_page_config(page_title="Signature Verification", layout="centered")
 
 # =============================
 # Custom Layer
@@ -15,14 +22,73 @@ class AbsoluteDifference(layers.Layer):
         return keras.ops.abs(x1 - x2)
 
 # =============================
-# Config & Load Model
+# Model Loading & Caching Logic
 # =============================
 IMG_SIZE = 224
-
-model = keras.models.load_model(
-    "siamese_signature_verification.keras",
-    custom_objects={"AbsoluteDifference": AbsoluteDifference}
+MODEL_FILENAME = "siamese_signature_verification.keras"
+DEFAULT_MODEL_URL = os.environ.get(
+    "MODEL_URL",
+    "https://huggingface.co/Venkatesanv/signature-verification/resolve/main/siamese_signature_verification.keras"
 )
+
+def download_model(target_path: str, url: str):
+    """Downloads model using requests streaming with urllib.request fallback."""
+    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+    temp_target = target_path + ".download"
+    try:
+        response = requests.get(url, stream=True, timeout=120)
+        response.raise_for_status()
+        with open(temp_target, "wb") as f:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
+    except Exception:
+        # Fallback to urllib.request
+        urllib.request.urlretrieve(url, temp_target)
+
+    if os.path.exists(temp_target) and os.path.getsize(temp_target) > 0:
+        os.replace(temp_target, target_path)
+    else:
+        raise RuntimeError("Model download resulted in an empty or corrupted file.")
+
+@st.cache_resource(show_spinner="Loading Siamese Signature Verification Model...")
+def load_signature_model():
+    # 1. Local development: use existing file directly if available
+    if os.path.exists(MODEL_FILENAME):
+        model_path = MODEL_FILENAME
+    else:
+        # 2. Production/Cloud: use cached temporary location
+        cache_dir = os.path.join(tempfile.gettempdir(), "signature_verification_cache")
+        cached_model_path = os.path.join(cache_dir, MODEL_FILENAME)
+
+        if not os.path.exists(cached_model_path) or os.path.getsize(cached_model_path) == 0:
+            model_url = None
+            try:
+                model_url = st.secrets.get("MODEL_URL", None)
+            except Exception:
+                model_url = None
+
+            if not model_url:
+                model_url = os.environ.get("MODEL_URL", DEFAULT_MODEL_URL)
+
+            with st.spinner("Downloading model weights from Hugging Face..."):
+                try:
+                    download_model(cached_model_path, model_url)
+                except Exception as exc:
+                    st.error(
+                        f"Failed to download model from `{model_url}`: {exc}. "
+                        "Please verify your `MODEL_URL` secret or environment variable."
+                    )
+                    raise exc
+
+        model_path = cached_model_path
+
+    return keras.models.load_model(
+        model_path,
+        custom_objects={"AbsoluteDifference": AbsoluteDifference}
+    )
+
+model = load_signature_model()
 
 # =============================
 # Preprocess Function
@@ -121,8 +187,6 @@ def main_app():
 # =============================
 # APP FLOW
 # =============================
-st.set_page_config(page_title="Signature Verification", layout="centered")
-
 if st.session_state.logged_in:
     main_app()
 else:
