@@ -239,17 +239,12 @@ def save_smtp_config(email, password, host="smtp.gmail.com", port=587):
 def send_verification_email(recipient_email: str, code: str, username: str):
     """Sends a real verification email via SMTP containing the 6-digit code."""
     config = load_smtp_config()
-    sender_email = config["email"]
-    sender_password = config["password"]
-    host = config["host"]
-    port = config["port"]
+    sender_email = config.get("email", "").strip()
+    sender_password = config.get("password", "").strip()
+    host = config.get("host", "smtp.gmail.com").strip()
 
     if not sender_email or not sender_password:
-        return False, (
-            "SMTP sender email is not configured yet. "
-            "Please expand '⚙️ Email Delivery Settings (SMTP / Gmail Setup)' below "
-            "and enter your Sender Gmail and App Password."
-        )
+        return False, "SMTP sender credentials not configured in Streamlit Secrets. Please add [smtp] email and password in Streamlit Cloud Secrets."
 
     try:
         msg = MIMEMultipart("alternative")
@@ -292,14 +287,24 @@ Signature Verification Team
         msg.attach(MIMEText(text_content, "plain"))
         msg.attach(MIMEText(html_content, "html"))
 
-        with smtplib.SMTP(host, port, timeout=20) as server:
-            server.ehlo()
-            server.starttls()
-            server.ehlo()
-            server.login(sender_email, sender_password)
-            server.sendmail(sender_email, recipient_email, msg.as_string())
-
-        return True, "Email sent successfully!"
+        # Try SSL 465 first
+        try:
+            with smtplib.SMTP_SSL(host, 465, timeout=20) as server:
+                server.login(sender_email, sender_password)
+                server.sendmail(sender_email, recipient_email, msg.as_string())
+            return True, "Email sent successfully!"
+        except Exception as ssl_err:
+            # Fallback to STARTTLS 587
+            try:
+                with smtplib.SMTP(host, 587, timeout=20) as server:
+                    server.ehlo()
+                    server.starttls()
+                    server.ehlo()
+                    server.login(sender_email, sender_password)
+                    server.sendmail(sender_email, recipient_email, msg.as_string())
+                return True, "Email sent successfully!"
+            except Exception as tls_err:
+                return False, f"SMTP Error: {str(ssl_err)}"
     except Exception as exc:
         return False, str(exc)
 
@@ -471,12 +476,14 @@ def login_page():
                     }
 
                     # Attempt email dispatch via SMTP
-                    sent, msg = send_verification_email(target_email, code, found_user)
+                    with st.spinner(f"Sending verification code to {target_email}..."):
+                        sent, msg = send_verification_email(target_email, code, found_user)
+
                     if sent:
                         st.success(f"📧 A 6-digit verification code has been sent directly to your email (**{target_email}**). Please check your inbox and enter the code below.")
                     else:
-                        st.success(f"📧 Verification code generated for **{target_email}**!")
-                        st.info(f"🔑 Your verification code is: **`{code}`**")
+                        st.error(f"❌ Could not send email to {target_email}: {msg}")
+                        st.warning("⚠️ Please configure your [smtp] email and App Password in Streamlit Cloud Secrets to dispatch emails.")
                 else:
                     st.error(f"❌ No registered account found for `{clean_email}`. Please check your email or create a new account.")
 
