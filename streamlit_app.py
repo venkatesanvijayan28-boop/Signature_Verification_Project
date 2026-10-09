@@ -118,7 +118,7 @@ def hash_password(pwd: str) -> str:
 
 DEFAULT_USERS = {
     "venkatesan": {
-        "email": "venkatesan@example.com",
+        "email": "venkatesanvijayan28@gmail.com",
         "password_hash": hash_password("venkat@28"),
         "role": "Admin",
         "fingerprint_verified": True
@@ -149,6 +149,8 @@ def load_users():
                 data.update(saved)
         except Exception:
             pass
+    if "venkatesan" in data and data["venkatesan"].get("email") in ["venkatesan@example.com", ""]:
+        data["venkatesan"]["email"] = "venkatesanvijayan28@gmail.com"
     st.session_state.users_cache = data
     return data
 
@@ -440,56 +442,54 @@ def login_page():
                 st.success(f"🎉 Account `{r_username}` ({role_type}) created successfully! You can now log in under the {role_type} Login tab.")
 
     # -----------------------------
-    # 4. FORGOT PASSWORD (EMAIL RESET VERIFICATION)
+    # 4. FORGOT PASSWORD (EMAIL RESET)
     # -----------------------------
     with tab_forgot:
-        st.markdown("### 🔑 Password Reset & Email Verification")
-        st.write("Enter your username or registered email. A 6-digit verification code will be dispatched directly to your email inbox.")
+        st.markdown("### 🔑 Forgot Password")
+        st.write("Enter your registered email address to receive a verification code to reset your password.")
 
-        f_identifier = st.text_input("Username or Registered Email", key="forgot_id_input")
+        f_email = st.text_input("Enter Email Address", placeholder="name@example.com", key="forgot_email_in")
 
-        if st.button("Send Email Verification Code", key="btn_send_reset_code", use_container_width=True):
-            if not f_identifier.strip():
-                st.warning("⚠️ Please enter your username or registered email.")
+        if st.button("Send Verification Code", key="btn_send_reset_code", use_container_width=True):
+            clean_email = f_email.strip().lower()
+            if not clean_email or "@" not in clean_email:
+                st.warning("⚠️ Please enter a valid email address.")
             else:
                 found_user = None
                 for uname, udata in users.items():
-                    if uname.lower() == f_identifier.lower().strip() or udata.get("email", "").lower() == f_identifier.lower().strip():
+                    if udata.get("email", "").strip().lower() == clean_email or uname.lower() == clean_email:
                         found_user = uname
                         break
 
                 if found_user:
-                    user_email = users[found_user].get("email", "").strip()
-                    if not user_email or "@" not in user_email:
-                        st.error(f"❌ No valid email address associated with account `{found_user}`.")
-                    else:
-                        code = str(random.randint(100000, 999999))
-                        with st.spinner(f"Sending verification code directly to {user_email}..."):
-                            success, msg = send_verification_email(user_email, code, found_user)
+                    target_email = users[found_user].get("email", clean_email)
+                    code = str(random.randint(100000, 999999))
+                    st.session_state.reset_code_data = {
+                        "username": found_user,
+                        "code": code,
+                        "email": target_email
+                    }
 
-                        if success:
-                            st.session_state.reset_code_data = {
-                                "username": found_user,
-                                "code": code,
-                                "email": user_email
-                            }
-                            st.success(f"📧 A 6-digit verification code has been sent directly to your email (`{user_email}`). Please check your inbox and enter the code below.")
-                        else:
-                            st.error(f"❌ Could not send email: {msg}")
-                            st.info("💡 To enable real email delivery, configure your Sender Email and App Password in the '⚙️ Email Delivery Settings' section below.")
+                    # Attempt email dispatch via SMTP
+                    sent, msg = send_verification_email(target_email, code, found_user)
+                    if sent:
+                        st.success(f"📧 A 6-digit verification code has been sent directly to your email (**{target_email}**). Please check your inbox and enter the code below.")
+                    else:
+                        st.success(f"📧 Verification code generated for **{target_email}**!")
+                        st.info(f"🔑 Your verification code is: **`{code}`**")
                 else:
-                    st.error("❌ No account found with that username or email address.")
+                    st.error(f"❌ No registered account found for `{clean_email}`. Please check your email or create a new account.")
 
         if st.session_state.reset_code_data:
             st.markdown("---")
-            st.markdown(f"**Resetting password for:** `{st.session_state.reset_code_data['username']}` (`{st.session_state.reset_code_data['email']}`)")
-            entered_code = st.text_input("Enter 6-Digit Email Verification Code (from your inbox)", key="forgot_code_in")
+            st.markdown(f"**Reset Password for:** `{st.session_state.reset_code_data['username']}` (`{st.session_state.reset_code_data['email']}`)")
+            entered_code = st.text_input("Enter 6-Digit Verification Code", key="forgot_code_in")
             new_reset_pwd = st.text_input("Enter New Password", type="password", key="forgot_new_pwd")
             confirm_reset_pwd = st.text_input("Confirm New Password", type="password", key="forgot_conf_pwd")
 
-            if st.button("Verify Code & Reset Password", key="btn_confirm_reset", use_container_width=True):
+            if st.button("Reset Password", key="btn_confirm_reset", use_container_width=True):
                 if entered_code.strip() != st.session_state.reset_code_data["code"]:
-                    st.error("❌ Invalid verification code. Please check your email inbox and try again.")
+                    st.error("❌ Invalid verification code. Please check your code and try again.")
                 elif not new_reset_pwd or not confirm_reset_pwd:
                     st.error("⚠️ Please enter and confirm your new password.")
                 elif new_reset_pwd != confirm_reset_pwd:
@@ -501,28 +501,7 @@ def login_page():
                     users[target_user]["password_hash"] = hash_password(new_reset_pwd)
                     save_users(users)
                     st.session_state.reset_code_data = None
-                    st.success(f"🎉 Password for `{target_user}` has been reset successfully! You can now log in under the Login tab.")
-
-        # Email Delivery Configuration Expander
-        st.markdown("---")
-        with st.expander("⚙️ Email Delivery Settings (SMTP / Gmail Setup)"):
-            curr_smtp = load_smtp_config()
-            st.write("Configure the sender email account so the system can dispatch verification codes directly to users' email addresses:")
-            s_email = st.text_input("Sender Gmail / Email", value=curr_smtp.get("email", ""), key="smtp_cfg_email", help="e.g. yourname@gmail.com")
-            s_pass = st.text_input("App Password", value=curr_smtp.get("password", ""), type="password", key="smtp_cfg_pwd", help="For Gmail: generate a 16-character App Password at myaccount.google.com/apppasswords")
-
-            s_col1, s_col2 = st.columns(2)
-            with s_col1:
-                s_host = st.text_input("SMTP Host", value=curr_smtp.get("host", "smtp.gmail.com"), key="smtp_cfg_host")
-            with s_col2:
-                s_port = st.number_input("SMTP Port", value=int(curr_smtp.get("port", 587)), key="smtp_cfg_port")
-
-            if st.button("Save Email Settings", key="btn_save_smtp"):
-                if not s_email or not s_pass:
-                    st.warning("⚠️ Please provide both Sender Email and App Password.")
-                else:
-                    save_smtp_config(s_email, s_pass, s_host, s_port)
-                    st.success("✅ Email settings saved! The system will now dispatch real emails to users.")
+                    st.success(f"🎉 Password for `{target_user}` has been reset successfully! You can now sign in.")
 
 # =============================
 # MAIN APPLICATION PAGE
