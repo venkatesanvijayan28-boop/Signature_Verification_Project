@@ -3,17 +3,31 @@ import tempfile
 import urllib.request
 import json
 import hashlib
-import random
-import smtplib
-import sqlite3
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 import cv2
 import numpy as np
 import requests
 import keras
 from keras import layers
 import streamlit as st
+
+from auth_db import (
+    init_db,
+    hash_password,
+    validate_email,
+    validate_password,
+    generate_reset_token,
+    db_get_user,
+    db_get_user_by_email,
+    db_create_user,
+    db_update_password,
+    db_create_reset_token,
+    db_verify_reset_token,
+    db_reset_password_with_token,
+    db_get_all_users,
+)
+
+# Initialize database schema on startup
+init_db()
 
 # =============================
 # Streamlit Page Configuration
@@ -109,249 +123,25 @@ def preprocess(image_path):
     return img
 
 # =============================
-# SQLite Database Management
+# Demo Password Reset Helper
 # =============================
-DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "signature_system.db")
-
-def hash_password(pwd: str) -> str:
-    return hashlib.sha256(pwd.encode()).hexdigest()
-
-def get_db_connection():
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-def init_db():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    # Users table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            username TEXT PRIMARY KEY,
-            email TEXT NOT NULL,
-            password_hash TEXT NOT NULL,
-            role TEXT NOT NULL,
-            fingerprint_verified INTEGER DEFAULT 1,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    # Password Resets table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS password_resets (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT NOT NULL,
-            email TEXT NOT NULL,
-            reset_code TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            is_used INTEGER DEFAULT 0
-        )
-    """)
-    conn.commit()
-
-    # Seed default accounts
-    cursor.execute("SELECT COUNT(*) FROM users")
-    if cursor.fetchone()[0] == 0:
-        cursor.execute(
-            "INSERT INTO users (username, email, password_hash, role, fingerprint_verified) VALUES (?, ?, ?, ?, ?)",
-            ("venkatesan", "venkatesanvijayan28@gmail.com", hash_password("venkat@28"), "Admin", 1)
-        )
-        cursor.execute(
-            "INSERT INTO users (username, email, password_hash, role, fingerprint_verified) VALUES (?, ?, ?, ?, ?)",
-            ("admin", "admin@signature.com", hash_password("admin@123"), "Admin", 1)
-        )
-        cursor.execute(
-            "INSERT INTO users (username, email, password_hash, role, fingerprint_verified) VALUES (?, ?, ?, ?, ?)",
-            ("user1", "user1@signature.com", hash_password("user@123"), "User", 1)
-        )
-        conn.commit()
-    else:
-        # Keep venkatesan email synchronized
-        cursor.execute(
-            "UPDATE users SET email = ? WHERE username = ? AND email != ?",
-            ("venkatesanvijayan28@gmail.com", "venkatesan", "venkatesanvijayan28@gmail.com")
-        )
-        conn.commit()
-
-    conn.close()
-
-init_db()
-
-# Database Helper Functions
-def db_get_user(username: str):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM users WHERE username = ?", (username.strip(),))
-    row = cursor.fetchone()
-    conn.close()
-    return dict(row) if row else None
-
-def db_get_user_by_email(email: str):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM users WHERE LOWER(email) = LOWER(?)", (email.strip(),))
-    row = cursor.fetchone()
-    conn.close()
-    return dict(row) if row else None
-
-def db_create_user(username: str, email: str, password_hash: str, role: str, fingerprint_verified: int = 1):
-    conn = get_db_connection()
-    cursor = conn.cursor()
+def is_demo_password_reset_enabled() -> bool:
+    """
+    Checks if demo password reset is explicitly enabled via secrets or env var.
+    Default: False for public deployments.
+    """
+    val = False
     try:
-        cursor.execute(
-            "INSERT INTO users (username, email, password_hash, role, fingerprint_verified) VALUES (?, ?, ?, ?, ?)",
-            (username.strip(), email.strip(), password_hash, role, fingerprint_verified)
-        )
-        conn.commit()
-        return True, "User registered successfully."
-    except sqlite3.IntegrityError:
-        return False, f"Username '{username}' already exists in database."
-    finally:
-        conn.close()
-
-def db_update_password(username: str, new_password_hash: str):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("UPDATE users SET password_hash = ? WHERE username = ?", (new_password_hash, username.strip()))
-    conn.commit()
-    conn.close()
-
-def db_store_reset_code(username: str, email: str, reset_code: str):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO password_resets (username, email, reset_code, is_used) VALUES (?, ?, ?, 0)",
-        (username.strip(), email.strip(), reset_code.strip())
-    )
-    conn.commit()
-    conn.close()
-
-def db_verify_and_use_reset_code(username: str, reset_code: str):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT id FROM password_resets WHERE username = ? AND reset_code = ? AND is_used = 0 ORDER BY id DESC LIMIT 1",
-        (username.strip(), reset_code.strip())
-    )
-    row = cursor.fetchone()
-    if row:
-        reset_id = row["id"]
-        cursor.execute("UPDATE password_resets SET is_used = 1 WHERE id = ?", (reset_id,))
-        conn.commit()
-        conn.close()
-        return True
-    conn.close()
-    return False
-
-def db_get_all_users():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT username, email, role, fingerprint_verified, created_at FROM users ORDER BY created_at ASC")
-    rows = cursor.fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
-
-# =============================
-# SMTP Email Sending Configuration
-# =============================
-def load_smtp_config():
-    config = {
-        "email": "",
-        "password": "",
-        "host": "smtp.gmail.com",
-        "port": 465
-    }
-    try:
-        if "smtp" in st.secrets:
-            config["email"] = st.secrets["smtp"].get("email") or st.secrets["smtp"].get("sender_email", "")
-            config["password"] = st.secrets["smtp"].get("password") or st.secrets["smtp"].get("sender_password", "")
-            config["host"] = st.secrets["smtp"].get("host", "smtp.gmail.com")
-            config["port"] = int(st.secrets["smtp"].get("port", 465))
-        elif "SMTP_EMAIL" in st.secrets:
-            config["email"] = st.secrets.get("SMTP_EMAIL", "")
-            config["password"] = st.secrets.get("SMTP_PASSWORD", "")
-            config["host"] = st.secrets.get("SMTP_HOST", "smtp.gmail.com")
-            config["port"] = int(st.secrets.get("SMTP_PORT", 465))
+        val = st.secrets.get("ENABLE_DEMO_PASSWORD_RESET", False)
     except Exception:
-        pass
+        val = False
 
-    if not config["email"] and os.environ.get("SMTP_EMAIL"):
-        config["email"] = os.environ.get("SMTP_EMAIL")
-    if not config["password"] and os.environ.get("SMTP_PASSWORD"):
-        config["password"] = os.environ.get("SMTP_PASSWORD")
+    if not val:
+        val = os.environ.get("ENABLE_DEMO_PASSWORD_RESET", "false")
 
-    return config
-
-def send_verification_email(recipient_email: str, code: str, username: str):
-    """Sends real verification email via SMTP containing the 6-digit code."""
-    config = load_smtp_config()
-    sender_email = config.get("email", "").strip()
-    sender_password = config.get("password", "").strip()
-    host = config.get("host", "smtp.gmail.com").strip()
-
-    if not sender_email or not sender_password:
-        return False, "SMTP credentials not configured in Streamlit Secrets."
-
-    try:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = "🔐 Password Reset Code - Signature Verification System"
-        msg["From"] = f"Signature Verification System <{sender_email}>"
-        msg["To"] = recipient_email
-
-        text_content = f"""Hello {username},
-
-You requested to reset your password for the Signature Verification System.
-
-Your 6-Digit Email Verification Code: {code}
-
-This code will expire in 15 minutes. Enter this code on the verification page to set your new password.
-
-If you did not request this password reset, please ignore this email.
-
-Best regards,
-Signature Verification Team
-"""
-        html_content = f"""
-        <html>
-          <body style="font-family: Arial, sans-serif; background-color: #f4f6f9; padding: 25px;">
-            <div style="max-width: 520px; margin: 0 auto; background-color: #ffffff; padding: 30px; border-radius: 10px; border: 1px solid #e1e4e8; box-shadow: 0 4px 6px rgba(0,0,0,0.05);">
-              <h2 style="color: #1f2937; margin-top: 0; text-align: center;">🔐 Password Reset Request</h2>
-              <p style="color: #4b5563; font-size: 15px;">Hello <strong>{username}</strong>,</p>
-              <p style="color: #4b5563; font-size: 15px;">We received a request to reset your password for the <strong>Signature Verification System</strong>. Use the 6-digit verification code below to proceed:</p>
-              
-              <div style="background: linear-gradient(135deg, #f0fdf4 0%, #dcfce7 100%); border: 1px solid #86efac; border-radius: 8px; padding: 20px; text-align: center; margin: 25px 0;">
-                <span style="font-size: 32px; font-weight: 800; letter-spacing: 8px; color: #15803d; font-family: monospace;">{code}</span>
-              </div>
-              
-              <p style="color: #6b7280; font-size: 13px; line-height: 1.5;">This verification code will expire in 15 minutes. If you did not request this reset, your account is safe and you can ignore this email.</p>
-              <hr style="border: none; border-top: 1px solid #e5e7eb; margin: 25px 0;">
-              <p style="color: #9ca3af; font-size: 12px; text-align: center; margin-bottom: 0;">Signature Verification Project • AI Security</p>
-            </div>
-          </body>
-        </html>
-        """
-        msg.attach(MIMEText(text_content, "plain"))
-        msg.attach(MIMEText(html_content, "html"))
-
-        # Try SSL 465 first
-        try:
-            with smtplib.SMTP_SSL(host, 465, timeout=20) as server:
-                server.login(sender_email, sender_password)
-                server.sendmail(sender_email, recipient_email, msg.as_string())
-            return True, "Email sent successfully!"
-        except Exception as ssl_err:
-            # Fallback to STARTTLS 587
-            try:
-                with smtplib.SMTP(host, 587, timeout=20) as server:
-                    server.ehlo()
-                    server.starttls()
-                    server.ehlo()
-                    server.login(sender_email, sender_password)
-                    server.sendmail(sender_email, recipient_email, msg.as_string())
-                return True, "Email sent successfully!"
-            except Exception as tls_err:
-                return False, f"SMTP Error: {str(ssl_err)}"
-    except Exception as exc:
-        return False, str(exc)
+    if isinstance(val, bool):
+        return val
+    return str(val).strip().lower() in ("true", "1", "yes", "enabled")
 
 # =============================
 # Session State Initialization
@@ -362,8 +152,61 @@ if "username" not in st.session_state:
     st.session_state.username = None
 if "role" not in st.session_state:
     st.session_state.role = None
-if "reset_code_data" not in st.session_state:
-    st.session_state.reset_code_data = None
+if "password_reset_success" not in st.session_state:
+    st.session_state.password_reset_success = False
+
+# =============================
+# RESET PASSWORD PAGE (TOKEN-BASED)
+# =============================
+def reset_password_page(token: str):
+    st.markdown("## 🔐 Password Reset")
+    st.caption("Secure token-based credential recovery")
+
+    if st.session_state.get("password_reset_success"):
+        st.success("🎉 Your password has been successfully updated! You can now sign in with your new password.")
+        if st.button("Return to Sign In", key="btn_return_login_after_success", use_container_width=True):
+            st.session_state.password_reset_success = False
+            st.query_params.clear()
+            st.rerun()
+        return
+
+    record, err = db_verify_reset_token(token)
+    if err:
+        st.error(f"❌ {err}")
+        st.info("The reset link may have expired (15-minute validity), already been used, or been invalidated by a newer request.")
+        if st.button("Return to Sign In", key="btn_return_login_after_err", use_container_width=True):
+            st.query_params.clear()
+            st.rerun()
+        return
+
+    st.info(f"Resetting password for: **{record['username']}** (`{record['email']}`)")
+
+    new_password = st.text_input("New Password (minimum 12 characters)", type="password", key="reset_page_new_pwd")
+    confirm_password = st.text_input("Confirm New Password", type="password", key="reset_page_conf_pwd")
+
+    col_sub, col_cancel = st.columns(2)
+    with col_sub:
+        if st.button("Reset Password", key="btn_exec_pw_reset", use_container_width=True):
+            if not new_password or not confirm_password:
+                st.error("⚠️ Both password fields are required.")
+            elif new_password != confirm_password:
+                st.error("❌ Passwords do not match.")
+            else:
+                is_valid, msg = validate_password(new_password)
+                if not is_valid:
+                    st.error(f"⚠️ {msg}")
+                else:
+                    success, reset_msg = db_reset_password_with_token(token, hash_password(new_password))
+                    if success:
+                        st.session_state.password_reset_success = True
+                        st.rerun()
+                    else:
+                        st.error(f"❌ {reset_msg}")
+
+    with col_cancel:
+        if st.button("Cancel & Return to Login", key="btn_cancel_pw_reset", use_container_width=True):
+            st.query_params.clear()
+            st.rerun()
 
 # =============================
 # LOGIN & ACCOUNT MANAGEMENT PAGE
@@ -467,7 +310,7 @@ def login_page():
         if st.button("Create Account", key="btn_register_account", use_container_width=True):
             if not r_username or not r_email or not r_password or not r_confirm:
                 st.error("⚠️ All fields are required.")
-            elif "@" not in r_email or "." not in r_email:
+            elif not validate_email(r_email):
                 st.error("⚠️ Please enter a valid email address.")
             elif r_password != r_confirm:
                 st.error("⚠️ Passwords do not match.")
@@ -491,66 +334,55 @@ def login_page():
                     st.error(f"⚠️ {message}")
 
     # -----------------------------
-    # 4. FORGOT PASSWORD (DATABASE + EMAIL RESET)
+    # 4. FORGOT PASSWORD (SECURE TOKEN RESET - NO SMTP NEEDED)
     # -----------------------------
     with tab_forgot:
         st.markdown("### 🔑 Forgot Password")
-        st.write("Enter your registered email address to receive a verification code to reset your password.")
+        st.write("Enter your registered email address to request a secure password-reset link.")
 
-        f_email = st.text_input("Enter Email Address", placeholder="name@example.com", key="forgot_email_in")
+        f_email = st.text_input("Enter Registered Email Address", placeholder="name@example.com", key="forgot_email_in")
 
-        if st.button("Send Verification Code", key="btn_send_reset_code", use_container_width=True):
+        if st.button("Request Password Reset", key="btn_request_reset_token", use_container_width=True):
             clean_email = f_email.strip().lower()
-            if not clean_email or "@" not in clean_email:
-                st.warning("⚠️ Please enter a valid email address.")
+            if not validate_email(clean_email):
+                st.error("⚠️ Please enter a valid email address.")
             else:
                 user_record = db_get_user_by_email(clean_email)
+                demo_enabled = is_demo_password_reset_enabled()
+
                 if user_record:
-                    target_user = user_record["username"]
-                    target_email = user_record["email"]
-                    code = str(random.randint(100000, 999999))
+                    raw_token = generate_reset_token()
+                    db_create_reset_token(user_record["username"], user_record["email"], raw_token, valid_minutes=15)
 
-                    # Save reset code in database
-                    db_store_reset_code(target_user, target_email, code)
+                    if demo_enabled:
+                        st.success("✅ Password reset request processed successfully.")
+                        st.markdown("#### 🧪 Demo Password Reset Link (Development Mode)")
+                        st.caption("No email has been sent. Because `ENABLE_DEMO_PASSWORD_RESET` is enabled for testing, use this link to complete the reset workflow:")
 
-                    st.session_state.reset_code_data = {
-                        "username": target_user,
-                        "email": target_email
-                    }
+                        # Form the relative query string URL
+                        demo_url = f"?reset_token={raw_token}"
+                        st.code(demo_url, language="text")
 
-                    # Attempt real email dispatch via SMTP
-                    with st.spinner(f"Sending verification code to {target_email}..."):
-                        sent, msg = send_verification_email(target_email, code, target_user)
-
-                    if sent:
-                        st.success(f"📧 A 6-digit verification code has been sent directly to your email (**{target_email}**). Please check your inbox and enter the code below.")
+                        if st.button("👉 Open Demo Reset Password Page", key="btn_open_demo_reset_page", use_container_width=True):
+                            st.query_params["reset_token"] = raw_token
+                            st.rerun()
                     else:
-                        st.error(f"❌ Could not send email to {target_email}: {msg}")
-                        st.warning("⚠️ Please configure your [smtp] email and App Password in Streamlit Cloud Secrets to dispatch emails.")
+                        # Production / Public deployment (demo mode disabled)
+                        st.info(
+                            "ℹ️ If an account associated with that email exists, the password reset request has been processed.\n\n"
+                            "⚠️ **Notice:** Automated email delivery is not configured on this server. "
+                            "Please contact your system administrator to assist with your password reset."
+                        )
                 else:
-                    st.error(f"❌ No registered account found in database for `{clean_email}`. Please verify your email or register.")
-
-        if st.session_state.reset_code_data:
-            st.markdown("---")
-            st.markdown(f"**Reset Password for:** `{st.session_state.reset_code_data['username']}` (`{st.session_state.reset_code_data['email']}`)")
-            entered_code = st.text_input("Enter 6-Digit Verification Code", key="forgot_code_in")
-            new_reset_pwd = st.text_input("Enter New Password", type="password", key="forgot_new_pwd")
-            confirm_reset_pwd = st.text_input("Confirm New Password", type="password", key="forgot_conf_pwd")
-
-            if st.button("Reset Password", key="btn_confirm_reset", use_container_width=True):
-                target_user = st.session_state.reset_code_data["username"]
-                if not db_verify_and_use_reset_code(target_user, entered_code):
-                    st.error("❌ Invalid or expired verification code. Please check your email code and try again.")
-                elif not new_reset_pwd or not confirm_reset_pwd:
-                    st.error("⚠️ Please enter and confirm your new password.")
-                elif new_reset_pwd != confirm_reset_pwd:
-                    st.error("⚠️ Passwords do not match.")
-                elif len(new_reset_pwd) < 4:
-                    st.error("⚠️ Password must be at least 4 characters.")
-                else:
-                    db_update_password(target_user, hash_password(new_reset_pwd))
-                    st.session_state.reset_code_data = None
-                    st.success(f"🎉 Password for `{target_user}` has been reset in the database! You can now sign in.")
+                    # Unknown account: generic response to prevent user enumeration
+                    if demo_enabled:
+                        st.warning("⚠️ No account found with that email address.")
+                    else:
+                        st.info(
+                            "ℹ️ If an account associated with that email exists, the password reset request has been processed.\n\n"
+                            "⚠️ **Notice:** Automated email delivery is not configured on this server. "
+                            "Please contact your system administrator to assist with your password reset."
+                        )
 
 # =============================
 # MAIN APPLICATION PAGE
@@ -561,7 +393,7 @@ def main_app():
 
     col_title, col_user = st.columns([3, 1])
     with col_title:
-        st.title("  Signature Verification System")
+        st.title("Signature Verification System")
     with col_user:
         st.markdown(f"**👤 User:** `{user_name}`")
         st.markdown(f"**Role:** `{user_role}`")
@@ -638,9 +470,13 @@ def main_app():
             st.warning("⚠️ Please upload both images.")
 
 # =============================
-# APP FLOW
+# APP FLOW & ROUTING
 # =============================
-if st.session_state.logged_in:
+query_token = st.query_params.get("reset_token")
+
+if query_token:
+    reset_password_page(query_token)
+elif st.session_state.logged_in:
     main_app()
 else:
     login_page()
