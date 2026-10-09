@@ -110,8 +110,8 @@ def preprocess(image_path):
 # =============================
 # User Account Management (Admin & User)
 # =============================
-USERS_FILE = os.path.join(tempfile.gettempdir(), "signature_users_db.json")
-SMTP_CONFIG_FILE = os.path.join(tempfile.gettempdir(), "signature_smtp_config.json")
+USERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "users_db.json")
+SMTP_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "smtp_config.json")
 
 def hash_password(pwd: str) -> str:
     return hashlib.sha256(pwd.encode()).hexdigest()

@@ -22,6 +22,7 @@ env/
 # Streamlit secrets and local caches
 .streamlit/secrets.toml
 .model_cache/
+users_db.json
 
 # IDE and OS files
 .vscode/
