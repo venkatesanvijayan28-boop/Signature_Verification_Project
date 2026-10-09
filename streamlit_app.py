@@ -5,6 +5,7 @@ import json
 import hashlib
 import random
 import smtplib
+import sqlite3
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import cv2
@@ -108,59 +109,146 @@ def preprocess(image_path):
     return img
 
 # =============================
-# User Account Management (Admin & User)
+# SQLite Database Management
 # =============================
-USERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "users_db.json")
-SMTP_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "smtp_config.json")
+DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "signature_system.db")
 
 def hash_password(pwd: str) -> str:
     return hashlib.sha256(pwd.encode()).hexdigest()
 
-DEFAULT_USERS = {
-    "venkatesan": {
-        "email": "venkatesanvijayan28@gmail.com",
-        "password_hash": hash_password("venkat@28"),
-        "role": "Admin",
-        "fingerprint_verified": True
-    },
-    "admin": {
-        "email": "admin@signature.com",
-        "password_hash": hash_password("admin@123"),
-        "role": "Admin",
-        "fingerprint_verified": True
-    },
-    "user1": {
-        "email": "user1@signature.com",
-        "password_hash": hash_password("user@123"),
-        "role": "User",
-        "fingerprint_verified": True
-    }
-}
+def get_db_connection():
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-def load_users():
-    if "users_cache" in st.session_state and st.session_state.users_cache:
-        return st.session_state.users_cache
+def init_db():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    # Users table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            username TEXT PRIMARY KEY,
+            email TEXT NOT NULL,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL,
+            fingerprint_verified INTEGER DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    # Password Resets table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS password_resets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL,
+            email TEXT NOT NULL,
+            reset_code TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            is_used INTEGER DEFAULT 0
+        )
+    """)
+    conn.commit()
 
-    data = DEFAULT_USERS.copy()
-    if os.path.exists(USERS_FILE):
-        try:
-            with open(USERS_FILE, "r") as f:
-                saved = json.load(f)
-                data.update(saved)
-        except Exception:
-            pass
-    if "venkatesan" in data and data["venkatesan"].get("email") in ["venkatesan@example.com", ""]:
-        data["venkatesan"]["email"] = "venkatesanvijayan28@gmail.com"
-    st.session_state.users_cache = data
-    return data
+    # Seed default accounts
+    cursor.execute("SELECT COUNT(*) FROM users")
+    if cursor.fetchone()[0] == 0:
+        cursor.execute(
+            "INSERT INTO users (username, email, password_hash, role, fingerprint_verified) VALUES (?, ?, ?, ?, ?)",
+            ("venkatesan", "venkatesanvijayan28@gmail.com", hash_password("venkat@28"), "Admin", 1)
+        )
+        cursor.execute(
+            "INSERT INTO users (username, email, password_hash, role, fingerprint_verified) VALUES (?, ?, ?, ?, ?)",
+            ("admin", "admin@signature.com", hash_password("admin@123"), "Admin", 1)
+        )
+        cursor.execute(
+            "INSERT INTO users (username, email, password_hash, role, fingerprint_verified) VALUES (?, ?, ?, ?, ?)",
+            ("user1", "user1@signature.com", hash_password("user@123"), "User", 1)
+        )
+        conn.commit()
+    else:
+        # Keep venkatesan email synchronized
+        cursor.execute(
+            "UPDATE users SET email = ? WHERE username = ? AND email != ?",
+            ("venkatesanvijayan28@gmail.com", "venkatesan", "venkatesanvijayan28@gmail.com")
+        )
+        conn.commit()
 
-def save_users(users_dict):
-    st.session_state.users_cache = users_dict
+    conn.close()
+
+init_db()
+
+# Database Helper Functions
+def db_get_user(username: str):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM users WHERE username = ?", (username.strip(),))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+def db_get_user_by_email(email: str):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM users WHERE LOWER(email) = LOWER(?)", (email.strip(),))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+def db_create_user(username: str, email: str, password_hash: str, role: str, fingerprint_verified: int = 1):
+    conn = get_db_connection()
+    cursor = conn.cursor()
     try:
-        with open(USERS_FILE, "w") as f:
-            json.dump(users_dict, f, indent=4)
-    except Exception:
-        pass
+        cursor.execute(
+            "INSERT INTO users (username, email, password_hash, role, fingerprint_verified) VALUES (?, ?, ?, ?, ?)",
+            (username.strip(), email.strip(), password_hash, role, fingerprint_verified)
+        )
+        conn.commit()
+        return True, "User registered successfully."
+    except sqlite3.IntegrityError:
+        return False, f"Username '{username}' already exists in database."
+    finally:
+        conn.close()
+
+def db_update_password(username: str, new_password_hash: str):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET password_hash = ? WHERE username = ?", (new_password_hash, username.strip()))
+    conn.commit()
+    conn.close()
+
+def db_store_reset_code(username: str, email: str, reset_code: str):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO password_resets (username, email, reset_code, is_used) VALUES (?, ?, ?, 0)",
+        (username.strip(), email.strip(), reset_code.strip())
+    )
+    conn.commit()
+    conn.close()
+
+def db_verify_and_use_reset_code(username: str, reset_code: str):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id FROM password_resets WHERE username = ? AND reset_code = ? AND is_used = 0 ORDER BY id DESC LIMIT 1",
+        (username.strip(), reset_code.strip())
+    )
+    row = cursor.fetchone()
+    if row:
+        reset_id = row["id"]
+        cursor.execute("UPDATE password_resets SET is_used = 1 WHERE id = ?", (reset_id,))
+        conn.commit()
+        conn.close()
+        return True
+    conn.close()
+    return False
+
+def db_get_all_users():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT username, email, role, fingerprint_verified, created_at FROM users ORDER BY created_at ASC")
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 # =============================
 # SMTP Email Sending Configuration
@@ -170,81 +258,38 @@ def load_smtp_config():
         "email": "",
         "password": "",
         "host": "smtp.gmail.com",
-        "port": 587
+        "port": 465
     }
-    # 1. Streamlit Secrets
     try:
         if "smtp" in st.secrets:
             config["email"] = st.secrets["smtp"].get("email") or st.secrets["smtp"].get("sender_email", "")
             config["password"] = st.secrets["smtp"].get("password") or st.secrets["smtp"].get("sender_password", "")
             config["host"] = st.secrets["smtp"].get("host", "smtp.gmail.com")
-            config["port"] = int(st.secrets["smtp"].get("port", 587))
+            config["port"] = int(st.secrets["smtp"].get("port", 465))
         elif "SMTP_EMAIL" in st.secrets:
             config["email"] = st.secrets.get("SMTP_EMAIL", "")
             config["password"] = st.secrets.get("SMTP_PASSWORD", "")
             config["host"] = st.secrets.get("SMTP_HOST", "smtp.gmail.com")
-            config["port"] = int(st.secrets.get("SMTP_PORT", 587))
+            config["port"] = int(st.secrets.get("SMTP_PORT", 465))
     except Exception:
         pass
 
-    # 2. Environment Variables
     if not config["email"] and os.environ.get("SMTP_EMAIL"):
         config["email"] = os.environ.get("SMTP_EMAIL")
     if not config["password"] and os.environ.get("SMTP_PASSWORD"):
         config["password"] = os.environ.get("SMTP_PASSWORD")
-    if os.environ.get("SMTP_HOST"):
-        config["host"] = os.environ.get("SMTP_HOST")
-    if os.environ.get("SMTP_PORT"):
-        config["port"] = int(os.environ.get("SMTP_PORT"))
-
-    # 3. Persistent Local Config File
-    if os.path.exists(SMTP_CONFIG_FILE):
-        try:
-            with open(SMTP_CONFIG_FILE, "r") as f:
-                saved = json.load(f)
-                if not config["email"]:
-                    config["email"] = saved.get("email", "")
-                if not config["password"]:
-                    config["password"] = saved.get("password", "")
-                if saved.get("host"):
-                    config["host"] = saved.get("host")
-                if saved.get("port"):
-                    config["port"] = int(saved.get("port"))
-        except Exception:
-            pass
-
-    # 4. Session State Override
-    if "smtp_email" in st.session_state and st.session_state.smtp_email:
-        config["email"] = st.session_state.smtp_email
-    if "smtp_password" in st.session_state and st.session_state.smtp_password:
-        config["password"] = st.session_state.smtp_password
 
     return config
 
-def save_smtp_config(email, password, host="smtp.gmail.com", port=587):
-    data = {
-        "email": email.strip(),
-        "password": password.strip(),
-        "host": host.strip(),
-        "port": int(port)
-    }
-    st.session_state.smtp_email = data["email"]
-    st.session_state.smtp_password = data["password"]
-    try:
-        with open(SMTP_CONFIG_FILE, "w") as f:
-            json.dump(data, f, indent=4)
-    except Exception:
-        pass
-
 def send_verification_email(recipient_email: str, code: str, username: str):
-    """Sends a real verification email via SMTP containing the 6-digit code."""
+    """Sends real verification email via SMTP containing the 6-digit code."""
     config = load_smtp_config()
     sender_email = config.get("email", "").strip()
     sender_password = config.get("password", "").strip()
     host = config.get("host", "smtp.gmail.com").strip()
 
     if not sender_email or not sender_password:
-        return False, "SMTP sender credentials not configured in Streamlit Secrets. Please add [smtp] email and password in Streamlit Cloud Secrets."
+        return False, "SMTP credentials not configured in Streamlit Secrets."
 
     try:
         msg = MIMEMultipart("alternative")
@@ -325,7 +370,7 @@ if "reset_code_data" not in st.session_state:
 # =============================
 def login_page():
     st.title("🔐 Signature Verification Portal")
-    st.subheader("Authentication & Access Management")
+    st.subheader("Database-Backed Authentication & Access Management")
 
     tab_user, tab_admin, tab_register, tab_forgot = st.tabs([
         "👤 User Login",
@@ -333,8 +378,6 @@ def login_page():
         "📝 Create New Account",
         "🔑 Forgot Password"
     ])
-
-    users = load_users()
 
     # -----------------------------
     # 1. USER LOGIN
@@ -345,11 +388,11 @@ def login_page():
         u_password = st.text_input("Password", type="password", key="user_login_p")
 
         if st.button("Sign In as User", key="btn_user_login", use_container_width=True):
-            user_info = users.get(u_username)
-            if user_info and user_info.get("password_hash") == hash_password(u_password):
+            user_info = db_get_user(u_username)
+            if user_info and user_info["password_hash"] == hash_password(u_password):
                 st.session_state.logged_in = True
                 st.session_state.username = u_username
-                st.session_state.role = user_info.get("role", "User")
+                st.session_state.role = user_info["role"]
                 st.success("✅ Login successful! Loading system...")
                 st.rerun()
             else:
@@ -365,9 +408,9 @@ def login_page():
         a_password = st.text_input("Admin Password", type="password", key="admin_login_p")
 
         if st.button("Sign In as Admin", key="btn_admin_login", use_container_width=True):
-            user_info = users.get(a_username)
-            if user_info and user_info.get("password_hash") == hash_password(a_password):
-                if user_info.get("role") == "Admin":
+            user_info = db_get_user(a_username)
+            if user_info and user_info["password_hash"] == hash_password(a_password):
+                if user_info["role"] == "Admin":
                     st.session_state.logged_in = True
                     st.session_state.username = a_username
                     st.session_state.role = "Admin"
@@ -379,7 +422,7 @@ def login_page():
                 st.error("❌ Invalid administrator credentials.")
 
     # -----------------------------
-    # 3. CREATE NEW ACCOUNT (USER OR ADMIN + FINGERPRINT / BIOMETRIC)
+    # 3. CREATE NEW ACCOUNT (STORED IN SQL DATABASE)
     # -----------------------------
     with tab_register:
         st.markdown("### 📝 Register New Account")
@@ -430,24 +473,25 @@ def login_page():
                 st.error("⚠️ Passwords do not match.")
             elif len(r_password) < 4:
                 st.error("⚠️ Password must be at least 4 characters.")
-            elif r_username in users:
-                st.error(f"⚠️ Username `{r_username}` is already taken. Please choose another.")
             elif not fp_scan:
                 st.error("⚠️ Biometric fingerprint verification is required to create an account.")
             elif role_type == "Admin" and admin_secret not in ["ADMIN@2026", "admin@123", "venkat@28", "ADMIN2026"]:
                 st.error("⛔ Invalid Admin Master Passcode. Use `ADMIN@2026` or contact system owner.")
             else:
-                users[r_username] = {
-                    "email": r_email.strip(),
-                    "password_hash": hash_password(r_password),
-                    "role": role_type,
-                    "fingerprint_verified": True
-                }
-                save_users(users)
-                st.success(f"🎉 Account `{r_username}` ({role_type}) created successfully! You can now log in under the {role_type} Login tab.")
+                ok, message = db_create_user(
+                    r_username,
+                    r_email,
+                    hash_password(r_password),
+                    role_type,
+                    1 if fp_scan else 0
+                )
+                if ok:
+                    st.success(f"🎉 Account `{r_username}` ({role_type}) registered in database! You can now log in under {role_type} Login or use Forgot Password with `{r_email}`.")
+                else:
+                    st.error(f"⚠️ {message}")
 
     # -----------------------------
-    # 4. FORGOT PASSWORD (EMAIL RESET)
+    # 4. FORGOT PASSWORD (DATABASE + EMAIL RESET)
     # -----------------------------
     with tab_forgot:
         st.markdown("### 🔑 Forgot Password")
@@ -460,24 +504,23 @@ def login_page():
             if not clean_email or "@" not in clean_email:
                 st.warning("⚠️ Please enter a valid email address.")
             else:
-                found_user = None
-                for uname, udata in users.items():
-                    if udata.get("email", "").strip().lower() == clean_email or uname.lower() == clean_email:
-                        found_user = uname
-                        break
-
-                if found_user:
-                    target_email = users[found_user].get("email", clean_email)
+                user_record = db_get_user_by_email(clean_email)
+                if user_record:
+                    target_user = user_record["username"]
+                    target_email = user_record["email"]
                     code = str(random.randint(100000, 999999))
+
+                    # Save reset code in database
+                    db_store_reset_code(target_user, target_email, code)
+
                     st.session_state.reset_code_data = {
-                        "username": found_user,
-                        "code": code,
+                        "username": target_user,
                         "email": target_email
                     }
 
-                    # Attempt email dispatch via SMTP
+                    # Attempt real email dispatch via SMTP
                     with st.spinner(f"Sending verification code to {target_email}..."):
-                        sent, msg = send_verification_email(target_email, code, found_user)
+                        sent, msg = send_verification_email(target_email, code, target_user)
 
                     if sent:
                         st.success(f"📧 A 6-digit verification code has been sent directly to your email (**{target_email}**). Please check your inbox and enter the code below.")
@@ -485,7 +528,7 @@ def login_page():
                         st.error(f"❌ Could not send email to {target_email}: {msg}")
                         st.warning("⚠️ Please configure your [smtp] email and App Password in Streamlit Cloud Secrets to dispatch emails.")
                 else:
-                    st.error(f"❌ No registered account found for `{clean_email}`. Please check your email or create a new account.")
+                    st.error(f"❌ No registered account found in database for `{clean_email}`. Please verify your email or register.")
 
         if st.session_state.reset_code_data:
             st.markdown("---")
@@ -495,8 +538,9 @@ def login_page():
             confirm_reset_pwd = st.text_input("Confirm New Password", type="password", key="forgot_conf_pwd")
 
             if st.button("Reset Password", key="btn_confirm_reset", use_container_width=True):
-                if entered_code.strip() != st.session_state.reset_code_data["code"]:
-                    st.error("❌ Invalid verification code. Please check your code and try again.")
+                target_user = st.session_state.reset_code_data["username"]
+                if not db_verify_and_use_reset_code(target_user, entered_code):
+                    st.error("❌ Invalid or expired verification code. Please check your email code and try again.")
                 elif not new_reset_pwd or not confirm_reset_pwd:
                     st.error("⚠️ Please enter and confirm your new password.")
                 elif new_reset_pwd != confirm_reset_pwd:
@@ -504,11 +548,9 @@ def login_page():
                 elif len(new_reset_pwd) < 4:
                     st.error("⚠️ Password must be at least 4 characters.")
                 else:
-                    target_user = st.session_state.reset_code_data["username"]
-                    users[target_user]["password_hash"] = hash_password(new_reset_pwd)
-                    save_users(users)
+                    db_update_password(target_user, hash_password(new_reset_pwd))
                     st.session_state.reset_code_data = None
-                    st.success(f"🎉 Password for `{target_user}` has been reset successfully! You can now sign in.")
+                    st.success(f"🎉 Password for `{target_user}` has been reset in the database! You can now sign in.")
 
 # =============================
 # MAIN APPLICATION PAGE
@@ -529,21 +571,22 @@ def main_app():
             st.session_state.role = None
             st.rerun()
 
-    # Admin Panel if logged in as Admin
+    # Admin Panel querying SQLite database directly
     if user_role == "Admin":
-        with st.expander("🛡️ Admin Dashboard: Registered Users & System Status"):
-            users = load_users()
-            user_list = [
+        with st.expander("🛡️ Admin Dashboard: Database Users & System Status"):
+            users_list = db_get_all_users()
+            display_list = [
                 {
-                    "Username": u,
-                    "Email": info.get("email", "-"),
-                    "Role": info.get("role", "User"),
-                    "Biometric / FP": "✅ Verified" if info.get("fingerprint_verified") else "⚠️ Pending"
+                    "Username": u["username"],
+                    "Email": u["email"],
+                    "Role": u["role"],
+                    "Biometric / FP": "✅ Verified" if u["fingerprint_verified"] else "⚠️ Pending",
+                    "Created At": u.get("created_at", "-")
                 }
-                for u, info in users.items()
+                for u in users_list
             ]
-            st.dataframe(user_list, use_container_width=True)
-            st.caption(f"Total registered accounts: {len(user_list)}")
+            st.dataframe(display_list, use_container_width=True)
+            st.caption(f"Total registered accounts in database: {len(display_list)}")
 
     st.write(
         "Upload a **reference signature** and a **test signature** "

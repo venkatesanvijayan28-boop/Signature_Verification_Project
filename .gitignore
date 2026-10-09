@@ -23,6 +23,8 @@ env/
 .streamlit/secrets.toml
 .model_cache/
 users_db.json
+*.db
+signature_system.db
 
 # IDE and OS files
 .vscode/
