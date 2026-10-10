@@ -232,16 +232,9 @@ def login_page():
             else:
                 st.error("❌ Invalid administrator credentials.")
 
-    # 3. Create Account (User / Admin)
+    # 3. Create Account (User Registration)
     with tab_register:
         st.markdown("### 📝 Register New Account")
-        role_type = st.radio(
-            "Account Role:",
-            ["User", "Admin"],
-            horizontal=True,
-            help="Choose User for standard verification, or Admin for management privileges",
-            key="reg_role_choice"
-        )
         col1, col2 = st.columns(2)
         with col1:
             r_username = st.text_input("Choose Username", key="reg_uname")
@@ -249,15 +242,6 @@ def login_page():
         with col2:
             r_password = st.text_input("Password (min 6 chars)", type="password", key="reg_pwd")
             r_confirm = st.text_input("Confirm Password", type="password", key="reg_pwd_conf")
-
-        admin_secret = ""
-        if role_type == "Admin":
-            admin_secret = st.text_input(
-                "Admin Master Passcode",
-                type="password",
-                help="Security passcode required to register an Admin account (Default: ADMIN@2026 or venkat@28)",
-                key="reg_admin_secret"
-            )
 
         st.markdown("#### 👆 Biometric 2FA Verification")
         fp_scan = st.checkbox("Biometric / Fingerprint Sensor Verified", value=True, key="reg_fp_sensor")
@@ -273,18 +257,16 @@ def login_page():
                 st.error("⚠️ Password must be at least 6 characters long.")
             elif not fp_scan:
                 st.error("⚠️ Biometric verification is required.")
-            elif role_type == "Admin" and admin_secret not in ["ADMIN@2026", "admin@123", "venkat@28", "ADMIN2026"]:
-                st.error("⛔ Invalid Admin Master Passcode. Use `ADMIN@2026` or contact system administrator.")
             else:
                 ok, msg = db_create_user(
                     r_username,
                     r_email,
                     hash_password(r_password),
-                    role_type,
+                    "User",
                     1 if fp_scan else 0
                 )
                 if ok:
-                    st.success(f"🎉 Account `{r_username}` ({role_type}) created in database! You can now log in.")
+                    st.success(f"🎉 User account `{r_username}` created in database! You can now log in under User Login.")
                 else:
                     st.error(f"⚠️ {msg}")
 
