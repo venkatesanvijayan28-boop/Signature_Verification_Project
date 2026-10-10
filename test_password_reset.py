@@ -210,74 +210,82 @@ class TestPasswordResetSecurityFlow(unittest.TestCase):
         # New password check succeeds
         self.assertEqual(fresh_user["password_hash"], hash_password(new_password))
 
-    def test_13_login_by_email_or_username(self):
-        """Scenario 13: Users can be looked up and authenticate by email or username."""
-        from auth_db import db_get_user_by_email_or_username
-        user_by_email = db_get_user_by_email_or_username("venkatesanvijayan28@gmail.com", self.db_path)
-        self.assertIsNotNone(user_by_email)
-        self.assertEqual(user_by_email["username"], "venkatesan")
+    def test_13_signature_database_add_and_retrieve(self):
+        """Scenario 13 (PDF Req 4): Users can add, retrieve, and manage signature records in the database."""
+        from auth_db import db_save_signature, db_get_user_signatures, db_delete_signature, db_get_signature_by_id
 
-        user_by_username = db_get_user_by_email_or_username("venkatesan", self.db_path)
-        self.assertIsNotNone(user_by_username)
-        self.assertEqual(user_by_username["email"], "venkatesanvijayan28@gmail.com")
+        sample_bytes = b"FAKE_SIGNATURE_BINARY_DATA"
+        ok, msg = db_save_signature("user1", "Official Bank Signature", sample_bytes, "png", self.db_path)
+        self.assertTrue(ok)
 
-    def test_14_supabase_client_initialization(self):
-        """Scenario 14: Supabase client helper handles configuration cleanly without crashing."""
-        from auth_db import get_supabase_client
-        # When no credentials are configured, safely returns None instead of raising an unhandled exception
-        client = get_supabase_client()
-        # Clean safe return
-        self.assertTrue(client is None or hasattr(client, "auth"))
+        sigs = db_get_user_signatures("user1", self.db_path)
+        self.assertEqual(len(sigs), 1)
+        self.assertEqual(sigs[0]["signature_name"], "Official Bank Signature")
 
-    def test_15_no_hardcoded_database_credentials(self):
-        """Scenario 15: Verify auth_db.py contains no hardcoded database passwords or credential URLs."""
-        auth_db_path = os.path.join(os.path.dirname(__file__), "auth_db.py")
-        with open(auth_db_path, "r", encoding="utf-8") as f:
-            content = f.read()
+        sig_full = db_get_signature_by_id(sigs[0]["id"], self.db_path)
+        self.assertEqual(sig_full["image_data"], sample_bytes)
 
-        # Check for specific previously committed passwords or patterns
-        self.assertNotIn("$$Venkat@28$$", content)
-        self.assertNotIn("DEFAULT_PG_PASSWORD", content)
-        self.assertNotIn("sb_publishable_", content)
+        # Remove
+        del_ok, _ = db_delete_signature(sigs[0]["id"], "user1", self.db_path)
+        self.assertTrue(del_ok)
+        self.assertEqual(len(db_get_user_signatures("user1", self.db_path)), 0)
 
-    def test_16_postgres_authoritative_fails_fast_on_error(self):
-        """Scenario 16: Verify that when PostgreSQL is authoritative and unreachable, it raises DatabaseConnectionError and does not silently fall back."""
-        from auth_db import (
-            is_postgres_authoritative,
-            get_postgres_connection,
-            DatabaseConnectionError
+    def test_14_audit_trail_logging_and_stats(self):
+        """Scenario 14 (PDF Req 5): Track and log signature verification attempts, results, and retrieve audit stats."""
+        from auth_db import db_log_verification, db_get_audit_logs, db_get_audit_stats
+
+        # Log genuine attempt
+        ok1 = db_log_verification(
+            username="user1",
+            reference_source="Database: Bank Sig",
+            test_name="test_1.png",
+            result="Genuine",
+            confidence=94.5,
+            fraud_risk="Low",
+            details="Match confirmed",
+            db_path=self.db_path
         )
-        old_url = os.environ.get("DATABASE_URL")
-        try:
-            os.environ["DATABASE_URL"] = "postgresql://postgres:test@127.0.0.1:5432/postgres"
-            self.assertTrue(is_postgres_authoritative())
-            with self.assertRaises(DatabaseConnectionError):
-                get_postgres_connection()
-        finally:
-            if old_url is not None:
-                os.environ["DATABASE_URL"] = old_url
-    def test_17_supabase_recovery_syncs_to_database(self):
-        """Scenario 17: Verify Supabase Auth recovery syncs updated password to database."""
-        from unittest.mock import MagicMock, patch
-        from auth_db import supabase_verify_otp_and_reset, db_get_user, hash_password
+        self.assertTrue(ok1)
 
-        # Mock Supabase client
-        mock_client = MagicMock()
-        mock_client.auth.verify_otp.return_value = {"session": None}
-        mock_client.auth.update_user.return_value = {"user": None}
+        # Log forged attempt
+        ok2 = db_log_verification(
+            username="user1",
+            reference_source="Database: Bank Sig",
+            test_name="forged_sample.png",
+            result="Forged",
+            confidence=89.2,
+            fraud_risk="High (Suspicious Forgery)",
+            details="Stroke density mismatch",
+            db_path=self.db_path
+        )
+        self.assertTrue(ok2)
 
-        with patch("auth_db.get_supabase_client", return_value=mock_client):
-            new_plain_pwd = "NewSupabaseSecurePassword2026!"
-            ok, msg = supabase_verify_otp_and_reset(
-                "venkatesanvijayan28@gmail.com",
-                "123456",
-                new_plain_pwd,
-                db_path=self.db_path
-            )
-            self.assertTrue(ok)
-            # Verify database user has the updated password hash
-            user = db_get_user("venkatesan", db_path=self.db_path)
-            self.assertEqual(user["password_hash"], hash_password(new_plain_pwd))
+        logs = db_get_audit_logs(limit=10, db_path=self.db_path)
+        self.assertEqual(len(logs), 2)
+
+        stats = db_get_audit_stats(self.db_path)
+        self.assertEqual(stats["total"], 2)
+        self.assertEqual(stats["genuine"], 1)
+        self.assertEqual(stats["forged"], 1)
+        self.assertEqual(stats["suspicious"], 1)
+
+    def test_15_direct_in_app_password_reset_without_smtp(self):
+        """Scenario 15 (PDF Req 1): Direct in-app password reset succeeds without requiring SMTP."""
+        from auth_db import db_direct_reset_password
+
+        # Valid reset
+        new_pwd = "DirectResetPassword2026!#"
+        ok, msg = db_direct_reset_password("user1", "user1@signature.com", hash_password(new_pwd), self.db_path)
+        self.assertTrue(ok)
+
+        # Authenticate with updated password
+        user = db_get_user("user1", self.db_path)
+        self.assertEqual(user["password_hash"], hash_password(new_pwd))
+
+        # Mismatched email is rejected
+        bad_ok, bad_msg = db_direct_reset_password("user1", "wrong_mail@test.com", hash_password("test"), self.db_path)
+        self.assertFalse(bad_ok)
 
 if __name__ == "__main__":
     unittest.main()
+

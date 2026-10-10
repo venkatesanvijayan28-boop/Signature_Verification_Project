@@ -1,4 +1,6 @@
 import os
+import io
+import csv
 import tempfile
 import urllib.request
 import json
@@ -15,47 +17,46 @@ from auth_db import (
     hash_password,
     validate_email,
     validate_password,
-    generate_reset_token,
     db_get_user,
     db_get_user_by_email,
-    db_get_user_by_email_or_username,
     db_create_user,
     db_update_password,
-    db_create_reset_token,
-    db_verify_reset_token,
-    db_reset_password_with_token,
+    db_direct_reset_password,
     db_get_all_users,
-    supabase_sync_user,
-    supabase_send_reset_email,
-    supabase_verify_otp_and_reset,
-    DatabaseConnectionError,
-    DatabaseError,
-    is_postgres_authoritative,
+    db_delete_user,
+    db_save_signature,
+    db_get_user_signatures,
+    db_get_signature_by_id,
+    db_delete_signature,
+    db_get_all_signatures,
+    db_log_verification,
+    db_get_audit_logs,
+    db_get_audit_stats,
 )
 
-# Safe database initialization on startup
-db_init_error = None
-try:
-    init_db()
-except Exception as exc:
-    db_init_error = str(exc)
+# Initialize database schema on startup
+init_db()
 
-# =============================
+# ==============================================================================
 # Streamlit Page Configuration
-# =============================
-st.set_page_config(page_title="Signature Verification", layout="centered")
+# ==============================================================================
+st.set_page_config(
+    page_title="AI-Powered Signature Verification System",
+    page_icon="✍️",
+    layout="wide"
+)
 
-# =============================
-# Custom Layer
-# =============================
+# ==============================================================================
+# Custom Layer (Siamese Architecture)
+# ==============================================================================
 class AbsoluteDifference(layers.Layer):
     def call(self, inputs):
         x1, x2 = inputs
         return keras.ops.abs(x1 - x2)
 
-# =============================
-# Model Loading & Caching Logic
-# =============================
+# ==============================================================================
+# Model Loading & Caching Logic (Machine Learning Component)
+# ==============================================================================
 IMG_SIZE = 224
 MODEL_FILENAME = "siamese_signature_verification.keras"
 DEFAULT_MODEL_URL = os.environ.get(
@@ -75,7 +76,6 @@ def download_model(target_path: str, url: str):
                 if chunk:
                     f.write(chunk)
     except Exception:
-        # Fallback to urllib.request
         urllib.request.urlretrieve(url, temp_target)
 
     if os.path.exists(temp_target) and os.path.getsize(temp_target) > 0:
@@ -83,13 +83,11 @@ def download_model(target_path: str, url: str):
     else:
         raise RuntimeError("Model download resulted in an empty or corrupted file.")
 
-@st.cache_resource(show_spinner="Loading Siamese Signature Verification Model...")
+@st.cache_resource(show_spinner="Loading Siamese Neural Network Model...")
 def load_signature_model():
-    # 1. Local development: use existing file directly if available
     if os.path.exists(MODEL_FILENAME):
         model_path = MODEL_FILENAME
     else:
-        # 2. Production/Cloud: use cached temporary location
         cache_dir = os.path.join(tempfile.gettempdir(), "signature_verification_cache")
         cached_model_path = os.path.join(cache_dir, MODEL_FILENAME)
 
@@ -107,10 +105,7 @@ def load_signature_model():
                 try:
                     download_model(cached_model_path, model_url)
                 except Exception as exc:
-                    st.error(
-                        f"Failed to download model from `{model_url}`: {exc}. "
-                        "Please verify your `MODEL_URL` secret or environment variable."
-                    )
+                    st.error(f"Failed to load model from `{model_url}`: {exc}")
                     raise exc
 
         model_path = cached_model_path
@@ -122,10 +117,11 @@ def load_signature_model():
 
 model = load_signature_model()
 
-# =============================
-# Preprocess Function
-# =============================
+# ==============================================================================
+# Image Processing & Feature Extraction (ML Component 2)
+# ==============================================================================
 def preprocess(image_path):
+    """Preprocesses signature image for Siamese neural network inference."""
     img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
     img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
     img = img / 255.0
@@ -133,195 +129,126 @@ def preprocess(image_path):
     img = np.expand_dims(img, axis=0)
     return img
 
-# =============================
-# Demo Password Reset Helper
-# =============================
-def is_demo_password_reset_enabled() -> bool:
+def extract_signature_features(image_path):
     """
-    Checks if demo password reset is explicitly enabled via secrets or env var.
-    Default: False for public deployments.
+    Extracts geometric and stroke features (density, aspect ratio, curvature/edge variance)
+    as specified in Functional Requirements & ML Feature Extraction.
     """
-    val = False
-    try:
-        val = st.secrets.get("ENABLE_DEMO_PASSWORD_RESET", False)
-    except Exception:
-        val = False
+    gray = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    if gray is None:
+        return {"density": 0.0, "aspect_ratio": 1.0, "edge_variance": 0.0}
 
-    if not val:
-        val = os.environ.get("ENABLE_DEMO_PASSWORD_RESET", "false")
+    # Binarize signature strokes
+    _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
+    stroke_pixels = cv2.countNonZero(thresh)
+    total_pixels = gray.shape[0] * gray.shape[1]
+    density = round((stroke_pixels / float(total_pixels)) * 100, 2)
 
-    if isinstance(val, bool):
-        return val
-    return str(val).strip().lower() in ("true", "1", "yes", "enabled")
+    # Bounding contour & aspect ratio
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        c = max(contours, key=cv2.contourArea)
+        x, y, w, h = cv2.boundingRect(c)
+        aspect_ratio = round(w / float(h), 2) if h > 0 else 1.0
+    else:
+        aspect_ratio = 1.0
 
-# =============================
+    # Curvature / edge variance using Sobel filter
+    sobel = cv2.Sobel(gray, cv2.CV_64F, 1, 1, ksize=3)
+    edge_variance = round(float(np.var(sobel)), 2)
+
+    return {
+        "density": density,
+        "aspect_ratio": aspect_ratio,
+        "edge_variance": edge_variance
+    }
+
+# ==============================================================================
 # Session State Initialization
-# =============================
+# ==============================================================================
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
 if "username" not in st.session_state:
     st.session_state.username = None
 if "role" not in st.session_state:
     st.session_state.role = None
-if "password_reset_success" not in st.session_state:
-    st.session_state.password_reset_success = False
+if "last_alert" not in st.session_state:
+    st.session_state.last_alert = None
 
-# =============================
-# RESET PASSWORD PAGE (TOKEN-BASED)
-# =============================
-def reset_password_page(token: str):
-    st.markdown("## 🔐 Password Reset")
-    st.caption("Secure token-based credential recovery")
-
-    if st.session_state.get("password_reset_success"):
-        st.success("🎉 Your password has been successfully updated! You can now sign in with your new password.")
-        if st.button("Return to Sign In", key="btn_return_login_after_success", use_container_width=True):
-            st.session_state.password_reset_success = False
-            st.query_params.clear()
-            st.rerun()
-        return
-
-    try:
-        record, err = db_verify_reset_token(token)
-    except DatabaseConnectionError as conn_err:
-        st.error(f"❌ Database Connection Error: {conn_err}")
-        if st.button("Return to Sign In", key="btn_return_login_after_conn_err", use_container_width=True):
-            st.query_params.clear()
-            st.rerun()
-        return
-
-    if err:
-        st.error(f"❌ {err}")
-        st.info("The reset link may have expired (15-minute validity), already been used, or been invalidated by a newer request.")
-        if st.button("Return to Sign In", key="btn_return_login_after_err", use_container_width=True):
-            st.query_params.clear()
-            st.rerun()
-        return
-
-    st.info(f"Resetting password for: **{record['username']}** (`{record['email']}`)")
-
-    new_password = st.text_input("New Password (minimum 12 characters)", type="password", key="reset_page_new_pwd")
-    confirm_password = st.text_input("Confirm New Password", type="password", key="reset_page_conf_pwd")
-
-    col_sub, col_cancel = st.columns(2)
-    with col_sub:
-        if st.button("Reset Password", key="btn_exec_pw_reset", use_container_width=True):
-            if not new_password or not confirm_password:
-                st.error("⚠️ Both password fields are required.")
-            elif new_password != confirm_password:
-                st.error("❌ Passwords do not match.")
-            else:
-                is_valid, msg = validate_password(new_password)
-                if not is_valid:
-                    st.error(f"⚠️ {msg}")
-                else:
-                    try:
-                        success, reset_msg = db_reset_password_with_token(token, hash_password(new_password))
-                        if success:
-                            st.session_state.password_reset_success = True
-                            st.rerun()
-                        else:
-                            st.error(f"❌ {reset_msg}")
-                    except DatabaseConnectionError as conn_err:
-                        st.error(f"❌ Database Connection Error: {conn_err}")
-                    except Exception as exc:
-                        st.error(f"❌ Password Reset Error: {exc}")
-
-    with col_cancel:
-        if st.button("Cancel & Return to Login", key="btn_cancel_pw_reset", use_container_width=True):
-            st.query_params.clear()
-            st.rerun()
-
-# =============================
-# LOGIN & ACCOUNT MANAGEMENT PAGE
-# =============================
+# ==============================================================================
+# Authentication & Access Management (Requirement 1)
+# ==============================================================================
 def login_page():
-    st.title("🔐 Signature Verification Portal")
-    st.subheader("Supabase & Database-Backed Authentication")
+    st.markdown("<h1 style='text-align: center;'>AI-Powered Signature Verification System</h1>", unsafe_allow_html=True)
+    st.markdown("<p style='text-align: center; color: #6b7280;'>Secure Biometric Authentication • Siamese CNN • Database Records</p>", unsafe_allow_html=True)
+    st.markdown("---")
 
-    if db_init_error:
-        st.error(f"❌ Database Connection Error: {db_init_error}")
-        st.warning("⚠️ The authoritative database is unreachable. Please verify your DATABASE_URL in Streamlit Cloud Secrets.")
-
-    tab_user, tab_admin, tab_register, tab_forgot = st.tabs([
+    tab_user, tab_admin, tab_register, tab_reset = st.tabs([
         "👤 User Login",
         "🛡️ Admin Login",
-        "📝 Create New Account",
-        "🔑 Forgot Password"
+        "📝 Register Account",
+        "🔑 Reset Password"
     ])
 
-    # -----------------------------
-    # 1. USER LOGIN (BY EMAIL)
-    # -----------------------------
+    # 1. User Sign In
     with tab_user:
         st.markdown("### 👤 User Sign In")
-        u_email = st.text_input("Email Address", placeholder="user@example.com", key="user_login_email")
-        u_password = st.text_input("Password", type="password", key="user_login_p")
+        u_username = st.text_input("Username", key="u_login_user")
+        u_password = st.text_input("Password", type="password", key="u_login_pass")
+        u_2fa = st.checkbox("Two-Factor / Biometric Authentication Verified (Sensor OK)", value=True, key="u_login_2fa")
 
-        if st.button("Sign In as User", key="btn_user_login", use_container_width=True):
-            try:
-                user_info = db_get_user_by_email_or_username(u_email)
+        if st.button("Sign In as User", key="btn_u_login", use_container_width=True):
+            if not u_2fa:
+                st.error("⚠️ Two-Factor / Biometric verification is required to sign in.")
+            else:
+                user_info = db_get_user(u_username)
                 if user_info and user_info["password_hash"] == hash_password(u_password):
                     st.session_state.logged_in = True
-                    st.session_state.username = user_info["username"]
+                    st.session_state.username = u_username
                     st.session_state.role = user_info["role"]
-                    st.success(f"✅ Login successful as {user_info['username']}! Loading system...")
+                    st.success("✅ Authentication successful!")
                     st.rerun()
                 else:
-                    st.error("❌ Invalid email address or password. Please verify your credentials.")
-            except DatabaseConnectionError as conn_err:
-                st.error(f"❌ Database Connection Error: {conn_err}")
-            except Exception as exc:
-                st.error(f"❌ Authentication Error: {exc}")
+                    st.error("❌ Invalid username or password.")
 
-    # -----------------------------
-    # 2. ADMIN LOGIN (BY EMAIL)
-    # -----------------------------
+    # 2. Admin Sign In
     with tab_admin:
         st.markdown("### 🛡️ Admin Sign In")
         st.caption("Restricted access for administrative accounts.")
-        a_email = st.text_input("Admin Email Address", placeholder="admin@example.com", key="admin_login_email")
-        a_password = st.text_input("Admin Password", type="password", key="admin_login_p")
+        a_username = st.text_input("Admin Username", key="a_login_user")
+        a_password = st.text_input("Admin Password", type="password", key="a_login_pass")
 
-        if st.button("Sign In as Admin", key="btn_admin_login", use_container_width=True):
-            try:
-                user_info = db_get_user_by_email_or_username(a_email)
-                if user_info and user_info["password_hash"] == hash_password(a_password):
-                    if user_info["role"] == "Admin":
-                        st.session_state.logged_in = True
-                        st.session_state.username = user_info["username"]
-                        st.session_state.role = "Admin"
-                        st.success(f"✅ Admin authenticated ({user_info['username']})!")
-                        st.rerun()
-                    else:
-                        st.error("⛔ This account does not have Admin privileges.")
+        if st.button("Sign In as Admin", key="btn_a_login", use_container_width=True):
+            user_info = db_get_user(a_username)
+            if user_info and user_info["password_hash"] == hash_password(a_password):
+                if user_info["role"] == "Admin":
+                    st.session_state.logged_in = True
+                    st.session_state.username = a_username
+                    st.session_state.role = "Admin"
+                    st.success("✅ Admin credentials verified!")
+                    st.rerun()
                 else:
-                    st.error("❌ Invalid administrator email address or password.")
-            except DatabaseConnectionError as conn_err:
-                st.error(f"❌ Database Connection Error: {conn_err}")
-            except Exception as exc:
-                st.error(f"❌ Authentication Error: {exc}")
+                    st.error("⛔ This account does not possess administrator privileges.")
+            else:
+                st.error("❌ Invalid administrator credentials.")
 
-    # -----------------------------
-    # 3. CREATE NEW ACCOUNT (AUTO-SYNC TO SUPABASE & DATABASE)
-    # -----------------------------
+    # 3. Create Account (User / Admin)
     with tab_register:
         st.markdown("### 📝 Register New Account")
         role_type = st.radio(
-            "Select Account Role:",
+            "Account Role:",
             ["User", "Admin"],
             horizontal=True,
             help="Choose User for standard verification, or Admin for management privileges",
             key="reg_role_choice"
         )
-
-        r_col1, r_col2 = st.columns(2)
-        with r_col1:
+        col1, col2 = st.columns(2)
+        with col1:
             r_username = st.text_input("Choose Username", key="reg_uname")
-            r_email = st.text_input("Email Address", key="reg_mail")
-        with r_col2:
-            r_password = st.text_input("Password", type="password", key="reg_pwd")
-            r_confirm = st.text_input("Confirm Password", type="password", key="reg_pwd_confirm")
+            r_email = st.text_input("Email Address", key="reg_email")
+        with col2:
+            r_password = st.text_input("Password (min 6 chars)", type="password", key="reg_pwd")
+            r_confirm = st.text_input("Confirm Password", type="password", key="reg_pwd_conf")
 
         admin_secret = ""
         if role_type == "Admin":
@@ -332,246 +259,373 @@ def login_page():
                 key="reg_admin_secret"
             )
 
-        st.markdown("---")
-        st.markdown("#### 👆 Biometric & Fingerprint Security Verification")
-        st.write("Scan and confirm your biometric fingerprint integrity before registering.")
+        st.markdown("#### 👆 Biometric 2FA Verification")
+        fp_scan = st.checkbox("Biometric / Fingerprint Sensor Verified", value=True, key="reg_fp_sensor")
 
-        fp_col1, fp_col2 = st.columns([1, 2])
-        with fp_col1:
-            fp_scan = st.checkbox("Scan Fingerprint Sensor", value=True, key="reg_fp_checkbox")
-        with fp_col2:
-            if fp_scan:
-                st.success("✅ Fingerprint Sensor: Biometric Match Verified (Sensor ID: BIO-FP-994)")
-            else:
-                st.warning("⚠️ Please place finger on sensor to complete biometric check.")
-
-        if st.button("Create Account", key="btn_register_account", use_container_width=True):
+        if st.button("Create Account", key="btn_create_account", use_container_width=True):
             if not r_username or not r_email or not r_password or not r_confirm:
                 st.error("⚠️ All fields are required.")
             elif not validate_email(r_email):
                 st.error("⚠️ Please enter a valid email address.")
             elif r_password != r_confirm:
                 st.error("⚠️ Passwords do not match.")
-            elif len(r_password) < 4:
-                st.error("⚠️ Password must be at least 4 characters.")
+            elif len(r_password) < 6:
+                st.error("⚠️ Password must be at least 6 characters long.")
             elif not fp_scan:
-                st.error("⚠️ Biometric fingerprint verification is required to create an account.")
+                st.error("⚠️ Biometric verification is required.")
             elif role_type == "Admin" and admin_secret not in ["ADMIN@2026", "admin@123", "venkat@28", "ADMIN2026"]:
-                st.error("⛔ Invalid Admin Master Passcode. Use `ADMIN@2026` or contact system owner.")
+                st.error("⛔ Invalid Admin Master Passcode. Use `ADMIN@2026` or contact system administrator.")
             else:
-                try:
-                    ok, message = db_create_user(
-                        r_username,
-                        r_email,
-                        hash_password(r_password),
-                        role_type,
-                        1 if fp_scan else 0,
-                        raw_password=r_password
-                    )
-                    if ok:
-                        st.success(f"🎉 Account `{r_username}` ({role_type}) registered in authoritative database! You can now log in using your email `{r_email}`.")
-                    else:
-                        st.error(f"⚠️ {message}")
-                except DatabaseConnectionError as conn_err:
-                    st.error(f"❌ Registration Failed (Database Connection Error): {conn_err}")
-                except Exception as exc:
-                    st.error(f"❌ Registration Error: {exc}")
+                ok, msg = db_create_user(
+                    r_username,
+                    r_email,
+                    hash_password(r_password),
+                    role_type,
+                    1 if fp_scan else 0
+                )
+                if ok:
+                    st.success(f"🎉 Account `{r_username}` ({role_type}) created in database! You can now log in.")
+                else:
+                    st.error(f"⚠️ {msg}")
 
-    # -----------------------------
-    # 4. FORGOT PASSWORD (SUPABASE EMAIL VERIFICATION & RESET)
-    # -----------------------------
-    with tab_forgot:
-        st.markdown("### 🔑 Forgot Password")
-        st.write("Enter your registered email address. Supabase will send a verification email to your inbox to reset your password.")
+    # 4. In-App Password Reset (Direct Database-Backed - Zero SMTP Errors)
+    with tab_reset:
+        st.markdown("### 🔑 In-App Password Recovery")
+        st.caption("Reset your password directly in the database using your registered username and email.")
+        reset_uname = st.text_input("Registered Username", key="res_uname")
+        reset_email = st.text_input("Registered Email Address", key="res_email")
+        reset_new_pwd = st.text_input("New Password", type="password", key="res_new_pwd")
+        reset_conf_pwd = st.text_input("Confirm New Password", type="password", key="res_conf_pwd")
+        reset_2fa = st.checkbox("Confirm Biometric / Two-Factor Identity Verification", value=True, key="res_2fa")
 
-        f_email = st.text_input("Enter Registered Email Address", placeholder="name@example.com", key="forgot_email_in")
-
-        if st.button("Send Verification Email to Reset Password", key="btn_request_reset_token", use_container_width=True):
-            clean_email = f_email.strip().lower()
-            if not validate_email(clean_email):
-                st.error("⚠️ Please enter a valid email address.")
+        if st.button("Reset Password", key="btn_direct_reset", use_container_width=True):
+            if not reset_uname or not reset_email or not reset_new_pwd or not reset_conf_pwd:
+                st.error("⚠️ All fields are required.")
+            elif reset_new_pwd != reset_conf_pwd:
+                st.error("❌ Passwords do not match.")
+            elif len(reset_new_pwd) < 6:
+                st.error("⚠️ Password must be at least 6 characters long.")
+            elif not reset_2fa:
+                st.error("⚠️ Biometric identity confirmation required.")
             else:
-                try:
-                    user_record = db_get_user_by_email(clean_email)
-                    # 1. Send real verification email via Supabase if configured
-                    sb_ok, sb_msg = supabase_send_reset_email(clean_email)
+                ok, msg = db_direct_reset_password(reset_uname, reset_email, hash_password(reset_new_pwd))
+                if ok:
+                    st.success("🎉 Password updated successfully in the database! You can now log in.")
+                else:
+                    st.error(f"❌ {msg}")
 
-                    # 2. Store reset tracking token in authoritative database
-                    if user_record:
-                        raw_token = generate_reset_token()
-                        db_create_reset_token(user_record["username"], user_record["email"], raw_token, valid_minutes=15)
-                        st.session_state["active_reset_token"] = raw_token
-                        st.session_state["active_reset_email"] = user_record["email"]
-                        st.session_state["active_reset_user"] = user_record["username"]
-                    else:
-                        st.session_state["active_reset_email"] = clean_email
-                        st.session_state["active_reset_user"] = clean_email
-
-                    if sb_ok:
-                        st.success(f"📧 Supabase verification email sent to **{clean_email}**! Please check your inbox.")
-                    else:
-                        st.info(f"📧 Password reset initiated for **{clean_email}**.")
-                    st.rerun()
-                except DatabaseConnectionError as conn_err:
-                    st.error(f"❌ Database Connection Error: {conn_err}")
-                except Exception as exc:
-                    st.error(f"❌ Request Error: {exc}")
-
-        # Active Reset Form with New Password & Confirm Password
-        if st.session_state.get("active_reset_email"):
-            target_email = st.session_state["active_reset_email"]
-            target_user = st.session_state.get("active_reset_user", target_email)
-            active_token = st.session_state.get("active_reset_token", "")
-
-            st.markdown("---")
-            st.markdown(f"#### 🔐 Reset Password for: `{target_email}`")
-            st.info("Check your inbox for the Supabase verification email, or set your new password directly below:")
-
-            if is_demo_password_reset_enabled() and active_token:
-                st.caption("🧪 Demo Password Reset Link (Development Mode):")
-                st.code(f"?reset_token={active_token}", language="text")
-
-            f_new_pwd = st.text_input("New Password (minimum 12 characters)", type="password", key="forgot_direct_new_pwd")
-            f_conf_pwd = st.text_input("Confirm New Password", type="password", key="forgot_direct_conf_pwd")
-
-            col_submit, col_dismiss = st.columns(2)
-            with col_submit:
-                if st.button("Reset Password", key="btn_forgot_direct_submit", use_container_width=True):
-                    if not f_new_pwd or not f_conf_pwd:
-                        st.error("⚠️ Please fill in both password fields.")
-                    elif f_new_pwd != f_conf_pwd:
-                        st.error("❌ Passwords do not match.")
-                    else:
-                        is_valid, msg = validate_password(f_new_pwd)
-                        if not is_valid:
-                            st.error(f"⚠️ {msg}")
-                        else:
-                            try:
-                                new_hash = hash_password(f_new_pwd)
-                                if active_token:
-                                    db_reset_password_with_token(active_token, new_hash)
-                                else:
-                                    db_update_password(target_user, new_hash)
-
-                                st.session_state["active_reset_email"] = None
-                                st.session_state["active_reset_token"] = None
-                                st.session_state["reset_tab_completed"] = True
-                                st.rerun()
-                            except DatabaseConnectionError as conn_err:
-                                st.error(f"❌ Database Connection Error: {conn_err}")
-                            except Exception as exc:
-                                st.error(f"❌ Password Reset Error: {exc}")
-
-            with col_dismiss:
-                if st.button("Cancel", key="btn_forgot_direct_cancel", use_container_width=True):
-                    st.session_state["active_reset_email"] = None
-                    st.session_state["active_reset_token"] = None
-                    st.rerun()
-
-        if st.session_state.get("reset_tab_completed"):
-            st.success("🎉 Your password has been successfully updated! You can now log in using your email address.")
-            if st.button("Sign In Now", key="btn_after_tab_reset_done", use_container_width=True):
-                st.session_state["reset_tab_completed"] = False
-                st.rerun()
-
-# =============================
-# MAIN APPLICATION PAGE
-# =============================
+# ==============================================================================
+# Main Application Dashboard
+# ==============================================================================
 def main_app():
-    user_name = st.session_state.get("username", "venkatesan")
+    user_name = st.session_state.get("username", "User")
     user_role = st.session_state.get("role", "User")
 
-    col_title, col_user = st.columns([3, 1])
-    with col_title:
-        st.title("Signature Verification System")
-    with col_user:
-        st.markdown(f"**👤 User:** `{user_name}`")
-        st.markdown(f"**Role:** `{user_role}`")
-        if st.button("Logout", key="main_logout_btn"):
+    # Navigation & Header
+    header_col1, header_col2 = st.columns([3, 1])
+    with header_col1:
+        st.title("✍️ AI-Powered Signature Verification System")
+        st.caption(f"Authenticated as: **{user_name}** | Access Level: **{user_role}**")
+    with header_col2:
+        st.write("")
+        if st.button("🚪 Sign Out", key="btn_signout", use_container_width=True):
             st.session_state.logged_in = False
             st.session_state.username = None
             st.session_state.role = None
             st.rerun()
 
-    # Admin Panel querying authoritative database
+    st.markdown("---")
+
+    # In-App Notification / Alert Banner (Functional Requirement 6)
+    if st.session_state.get("last_alert"):
+        alert_info = st.session_state.last_alert
+        if alert_info["type"] == "forged":
+            st.error(f"🚨 **SECURITY ALERT:** Suspicious / Forged Signature Detected! (Confidence: {alert_info['confidence']}%, Fraud Risk: HIGH). Attempt logged in Audit Trail.")
+        elif alert_info["type"] == "genuine":
+            st.success(f"✅ **IN-APP NOTIFICATION:** Signature Authenticity Verified Successfully (Confidence: {alert_info['confidence']}%).")
+
+    # Admin Management Interface (Functional Requirement 7)
     if user_role == "Admin":
-        with st.expander("🛡️ Admin Dashboard: Database Users & System Status"):
-            try:
-                users_list = db_get_all_users()
-                display_list = [
+        with st.expander("🛡️ Admin Management Panel (Accounts, Signatures, Audit Trail & Reports)", expanded=False):
+            adm_tab1, adm_tab2, adm_tab3, adm_tab4 = st.tabs([
+                "👥 User Accounts",
+                "✍️ Signature Records",
+                "📋 Audit Trail",
+                "📊 Reports & Analytics"
+            ])
+
+            # Tab 1: User Accounts
+            with adm_tab1:
+                st.markdown("#### Registered User Accounts")
+                all_users = db_get_all_users()
+                display_users = [
                     {
                         "Username": u["username"],
                         "Email": u["email"],
                         "Role": u["role"],
-                        "Biometric / FP": "✅ Verified" if u["fingerprint_verified"] else "⚠️ Pending",
+                        "2FA / Biometric": "✅ Verified" if u["fingerprint_verified"] else "⚠️ Pending",
                         "Created At": u.get("created_at", "-")
                     }
-                    for u in users_list
+                    for u in all_users
                 ]
-                st.dataframe(display_list, use_container_width=True)
-                st.caption(f"Total registered accounts in authoritative database: {len(display_list)}")
-            except DatabaseConnectionError as conn_err:
-                st.error(f"❌ Database Connection Error: {conn_err}")
-            except Exception as exc:
-                st.error(f"❌ Failed to fetch users: {exc}")
+                st.dataframe(display_users, use_container_width=True)
 
-    st.write(
-        "Upload a **reference signature** and a **test signature** "
-        "to verify authenticity."
-    )
+                del_col1, del_col2 = st.columns([3, 1])
+                with del_col1:
+                    user_to_delete = st.selectbox("Select user to manage / delete:", [u["username"] for u in all_users if u["username"] not in ("admin", "venkatesan")])
+                with del_col2:
+                    if st.button("Delete User", key="btn_delete_user"):
+                        if user_to_delete:
+                            ok, del_msg = db_delete_user(user_to_delete)
+                            if ok:
+                                st.success(del_msg)
+                                st.rerun()
+                            else:
+                                st.error(del_msg)
 
-    ref_file = st.file_uploader(
-        "Upload Reference Signature (Genuine)",
-        type=["png", "jpg", "jpeg"]
-    )
+            # Tab 2: Signature Records
+            with adm_tab2:
+                st.markdown("#### All Stored Signature Records (Database)")
+                all_sigs = db_get_all_signatures()
+                if all_sigs:
+                    st.dataframe(all_sigs, use_container_width=True)
+                    sig_to_view = st.selectbox("View Stored Signature Record:", [s["id"] for s in all_sigs], format_func=lambda sid: f"ID #{sid} - {next((s['signature_name'] for s in all_sigs if s['id'] == sid), '')} ({next((s['username'] for s in all_sigs if s['id'] == sid), '')})")
+                    if sig_to_view:
+                        sig_rec = db_get_signature_by_id(sig_to_view)
+                        if sig_rec:
+                            st.image(sig_rec["image_data"], caption=f"Stored Signature: {sig_rec['signature_name']} by {sig_rec['username']}", width=250)
+                            if st.button("Delete This Signature Record", key="btn_del_sig_adm"):
+                                db_delete_signature(sig_to_view)
+                                st.success("Record removed from database.")
+                                st.rerun()
+                else:
+                    st.info("No signatures stored in database yet.")
 
-    test_file = st.file_uploader(
-        "Upload Test Signature",
-        type=["png", "jpg", "jpeg"]
-    )
+            # Tab 3: Audit Trail (Requirement 5)
+            with adm_tab3:
+                st.markdown("#### Audit Trail: Signature Verification Attempts")
+                audit_logs = db_get_audit_logs(limit=150)
+                if audit_logs:
+                    st.dataframe(audit_logs, use_container_width=True)
+                else:
+                    st.info("No verification audit records logged yet.")
 
-    if st.button("Verify Signature"):
-        if ref_file and test_file:
-            # Save uploaded files temporarily
-            with tempfile.NamedTemporaryFile(delete=False) as ref_temp:
-                ref_temp.write(ref_file.read())
-                ref_path = ref_temp.name
+            # Tab 4: Reports & Analytics
+            with adm_tab4:
+                st.markdown("#### Verification Analytics & Exportable Reports")
+                stats = db_get_audit_stats()
+                stat_col1, stat_col2, stat_col3, stat_col4 = st.columns(4)
+                stat_col1.metric("Total Verifications", stats["total"])
+                stat_col2.metric("Genuine Matches", stats["genuine"])
+                stat_col3.metric("Forged / Rejected", stats["forged"])
+                stat_col4.metric("Suspicious Alerts", stats["suspicious"])
 
-            with tempfile.NamedTemporaryFile(delete=False) as test_temp:
-                test_temp.write(test_file.read())
-                test_path = test_temp.name
+                # CSV Report Export
+                audit_logs = db_get_audit_logs(limit=500)
+                if audit_logs:
+                    csv_buffer = io.StringIO()
+                    writer = csv.DictWriter(csv_buffer, fieldnames=audit_logs[0].keys())
+                    writer.writeheader()
+                    writer.writerows(audit_logs)
+                    csv_data = csv_buffer.getvalue()
 
-            # Preprocess
-            img1 = preprocess(ref_path)
-            img2 = preprocess(test_path)
+                    st.download_button(
+                        label="📥 Download Detailed Audit Report (CSV)",
+                        data=csv_data,
+                        file_name="signature_verification_audit_report.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
 
-            # Predict
-            score = model.predict([img1, img2])[0][0]
-
-            if score >= 0.5:
-                st.success("✅ Result: Genuine")
-                confidence = round(score * 100, 2)
-            else:
-                st.error("❌ Result: Forged")
-                confidence = round((1 - score) * 100, 2)
-
-            st.write(f"**Confidence:** {confidence} %")
-
-            # Cleanup
-            os.remove(ref_path)
-            os.remove(test_path)
-
+    # ==========================================================================
+    # Signature Database Management (Functional Requirement 4)
+    # ==========================================================================
+    with st.expander("📁 My Stored Signature Database (Add / View Saved Signatures)", expanded=False):
+        user_sigs = db_get_user_signatures(user_name)
+        st.markdown(f"**Stored Genuine Signatures for `{user_name}`:**")
+        if user_sigs:
+            sig_cols = st.columns(min(len(user_sigs), 4))
+            for i, sig in enumerate(user_sigs):
+                with sig_cols[i % len(sig_cols)]:
+                    sig_data = db_get_signature_by_id(sig["id"])
+                    if sig_data:
+                        st.image(sig_data["image_data"], caption=sig["signature_name"], width=160)
+                        if st.button("🗑️ Remove", key=f"del_sig_{sig['id']}"):
+                            db_delete_signature(sig["id"], username=user_name)
+                            st.success("Removed.")
+                            st.rerun()
         else:
-            st.warning("⚠️ Please upload both images.")
+            st.info("You haven't saved any reference signatures to your database yet.")
 
-# =============================
-# APP FLOW & ROUTING
-# =============================
-query_token = st.query_params.get("reset_token")
+        st.markdown("---")
+        st.markdown("#### ➕ Add New Genuine Signature to Database")
+        new_sig_name = st.text_input("Signature Label / Purpose", placeholder="e.g. Official Bank Signature", key="in_new_sig_name")
+        new_sig_file = st.file_uploader("Upload Genuine Signature File (PNG, JPG, JPEG)", type=["png", "jpg", "jpeg"], key="in_new_sig_file")
 
-if query_token:
-    reset_password_page(query_token)
-elif st.session_state.logged_in:
+        if st.button("💾 Save Signature to Database", key="btn_save_sig"):
+            if not new_sig_name or not new_sig_file:
+                st.warning("⚠️ Please provide a label and select a signature image.")
+            else:
+                img_bytes = new_sig_file.read()
+                ext = new_sig_file.name.split(".")[-1].lower()
+                ok, smsg = db_save_signature(user_name, new_sig_name, img_bytes, file_type=ext)
+                if ok:
+                    st.success("✅ Signature stored successfully in database!")
+                    st.rerun()
+                else:
+                    st.error(f"❌ {smsg}")
+
+    # ==========================================================================
+    # Signature Verification Interface (Functional Requirements 2 & 3)
+    # ==========================================================================
+    st.markdown("### 🔍 AI Signature Verification")
+    st.write("Compare an uploaded signature with stored signature data or a reference file to verify authenticity.")
+
+    v_col1, v_col2 = st.columns(2)
+
+    # 1. Reference Signature Source
+    with v_col1:
+        st.markdown("#### 1. Reference Signature (Genuine)")
+        user_sigs = db_get_user_signatures(user_name)
+
+        ref_source_options = ["Upload Reference Signature File"]
+        if user_sigs:
+            ref_source_options.insert(0, "Select from Stored Database Signatures")
+
+        ref_mode = st.radio("Reference Source:", ref_source_options, key="ref_mode_choice")
+
+        ref_img_path = None
+        ref_source_desc = ""
+
+        if ref_mode == "Select from Stored Database Signatures" and user_sigs:
+            selected_sig_id = st.selectbox(
+                "Choose Stored Signature:",
+                [s["id"] for s in user_sigs],
+                format_func=lambda sid: next((s["signature_name"] for s in user_sigs if s["id"] == sid), ""),
+                key="sel_db_sig"
+            )
+            sig_obj = db_get_signature_by_id(selected_sig_id)
+            if sig_obj:
+                st.image(sig_obj["image_data"], caption=f"Selected: {sig_obj['signature_name']}", width=220)
+                # Save temporarily for preprocessing
+                with tempfile.NamedTemporaryFile(delete=False, suffix=f".{sig_obj['file_type']}") as tmp_ref:
+                    tmp_ref.write(sig_obj["image_data"])
+                    ref_img_path = tmp_ref.name
+                ref_source_desc = f"Database: {sig_obj['signature_name']}"
+        else:
+            ref_file = st.file_uploader(
+                "Upload Reference Signature Image",
+                type=["png", "jpg", "jpeg"],
+                key="upl_ref_file"
+            )
+            if ref_file:
+                st.image(ref_file, caption="Uploaded Genuine Reference", width=220)
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp_ref:
+                    tmp_ref.write(ref_file.read())
+                    ref_img_path = tmp_ref.name
+                ref_source_desc = f"Uploaded File: {ref_file.name}"
+
+    # 2. Test Signature Upload
+    with v_col2:
+        st.markdown("#### 2. Test Signature (To Verify)")
+        test_file = st.file_uploader(
+            "Upload Test Signature Image",
+            type=["png", "jpg", "jpeg"],
+            key="upl_test_file"
+        )
+        test_img_path = None
+        if test_file:
+            st.image(test_file, caption="Uploaded Test Signature", width=220)
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp_test:
+                tmp_test.write(test_file.read())
+                test_img_path = tmp_test.name
+
+    st.markdown("---")
+
+    # Verification Action Button
+    if st.button("🚀 Verify Signature Authenticity", key="btn_run_verify", use_container_width=True):
+        if not ref_img_path or not test_img_path:
+            st.warning("⚠️ Please provide both a genuine reference signature and a test signature to proceed.")
+        else:
+            with st.spinner("Analyzing stroke geometry, contour features, and Siamese CNN embeddings..."):
+                # Preprocess for Siamese CNN
+                img1 = preprocess(ref_img_path)
+                img2 = preprocess(test_img_path)
+
+                # Inference
+                score = float(model.predict([img1, img2])[0][0])
+
+                # Feature extraction (ML Component 2)
+                feats_ref = extract_signature_features(ref_img_path)
+                feats_test = extract_signature_features(test_img_path)
+
+                # Density difference
+                density_diff = abs(feats_ref["density"] - feats_test["density"])
+                aspect_ratio_diff = abs(feats_ref["aspect_ratio"] - feats_test["aspect_ratio"])
+
+                # Determine Result & Confidence Score (ML Component 3)
+                if score >= 0.5:
+                    result = "Genuine"
+                    confidence = round(score * 100, 2)
+                    fraud_risk = "Low" if density_diff < 15.0 else "Medium (Minor Inconsistency)"
+                else:
+                    result = "Forged"
+                    confidence = round((1.0 - score) * 100, 2)
+                    fraud_risk = "High (Suspicious Forgery)"
+
+                # In-App Notification / Security Alert
+                st.session_state.last_alert = {
+                    "type": "genuine" if result == "Genuine" else "forged",
+                    "confidence": confidence
+                }
+
+                # Audit Trail Logging (Functional Requirement 5)
+                test_name = test_file.name if test_file else "test_signature.png"
+                log_details = f"Siamese score: {round(score, 4)} | Stroke density diff: {round(density_diff, 2)}% | Aspect diff: {round(aspect_ratio_diff, 2)}"
+                db_log_verification(
+                    username=user_name,
+                    reference_source=ref_source_desc,
+                    test_name=test_name,
+                    result=result,
+                    confidence=confidence,
+                    fraud_risk=fraud_risk,
+                    details=log_details
+                )
+
+                # Clean up temporary files
+                try:
+                    if os.path.exists(ref_img_path):
+                        os.remove(ref_img_path)
+                    if os.path.exists(test_img_path):
+                        os.remove(test_img_path)
+                except Exception:
+                    pass
+
+                # Display Results
+                res_box1, res_box2 = st.columns([2, 1])
+                with res_box1:
+                    if result == "Genuine":
+                        st.success(f"### ✅ Verification Result: GENUINE")
+                        st.write(f"The test signature matches the reference pattern with **{confidence}%** confidence.")
+                    else:
+                        st.error(f"### 🚨 Verification Result: FORGED")
+                        st.write(f"The test signature does NOT match the authentic pattern. Confidence of forgery: **{confidence}%**.")
+
+                with res_box2:
+                    st.metric("Model Confidence Score", f"{confidence} %")
+                    st.metric("Fraud / Anomaly Risk", fraud_risk)
+
+                # Display Extracted Features
+                with st.expander("🔬 Feature Extraction & Image Processing Analysis (Details)", expanded=True):
+                    feat_col1, feat_col2, feat_col3 = st.columns(3)
+                    feat_col1.metric("Reference Stroke Density", f"{feats_ref['density']}%", f"Diff: {round(density_diff, 2)}%")
+                    feat_col2.metric("Test Stroke Density", f"{feats_test['density']}%")
+                    feat_col3.metric("Aspect Ratio Match", f"{feats_test['aspect_ratio']}", f"Ref: {feats_ref['aspect_ratio']}")
+
+# ==============================================================================
+# App Routing
+# ==============================================================================
+if st.session_state.logged_in:
     main_app()
 else:
     login_page()
