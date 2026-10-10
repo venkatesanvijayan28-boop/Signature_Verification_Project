@@ -355,17 +355,10 @@ def login_page():
                     db_create_reset_token(user_record["username"], user_record["email"], raw_token, valid_minutes=15)
 
                     if demo_enabled:
-                        st.success("✅ Password reset request processed successfully.")
-                        st.markdown("#### 🧪 Demo Password Reset Link (Development Mode)")
-                        st.caption("No email has been sent. Because `ENABLE_DEMO_PASSWORD_RESET` is enabled for testing, use this link to complete the reset workflow:")
-
-                        # Form the relative query string URL
-                        demo_url = f"?reset_token={raw_token}"
-                        st.code(demo_url, language="text")
-
-                        if st.button("👉 Open Demo Reset Password Page", key="btn_open_demo_reset_page", use_container_width=True):
-                            st.query_params["reset_token"] = raw_token
-                            st.rerun()
+                        st.session_state["active_demo_token"] = raw_token
+                        st.session_state["active_demo_user"] = user_record["username"]
+                        st.session_state["active_demo_email"] = user_record["email"]
+                        st.rerun()
                     else:
                         # Production / Public deployment (demo mode disabled)
                         st.info(
@@ -383,6 +376,52 @@ def login_page():
                             "⚠️ **Notice:** Automated email delivery is not configured on this server. "
                             "Please contact your system administrator to assist with your password reset."
                         )
+
+        # Active Demo Reset Form (Direct inline reset with New Password & Confirm Password)
+        if st.session_state.get("active_demo_token"):
+            demo_token = st.session_state["active_demo_token"]
+            demo_user = st.session_state.get("active_demo_user", "")
+            demo_mail = st.session_state.get("active_demo_email", "")
+
+            st.markdown("---")
+            st.success("✅ Password reset request processed successfully.")
+            st.markdown("#### 🧪 Demo Password Reset Link (Development Mode)")
+            st.caption("No email has been sent. Because `ENABLE_DEMO_PASSWORD_RESET` is active for testing, you can open the reset page or enter your new password below:")
+            st.code(f"?reset_token={demo_token}", language="text")
+
+            st.markdown(f"**Reset Credentials for:** `{demo_user}` (`{demo_mail}`)")
+            f_new_pwd = st.text_input("New Password (minimum 12 characters)", type="password", key="forgot_direct_new_pwd")
+            f_conf_pwd = st.text_input("Confirm New Password", type="password", key="forgot_direct_conf_pwd")
+
+            col_submit, col_dismiss = st.columns(2)
+            with col_submit:
+                if st.button("Reset Password", key="btn_forgot_direct_submit", use_container_width=True):
+                    if not f_new_pwd or not f_conf_pwd:
+                        st.error("⚠️ Please fill in both password fields.")
+                    elif f_new_pwd != f_conf_pwd:
+                        st.error("❌ Passwords do not match.")
+                    else:
+                        is_valid, msg = validate_password(f_new_pwd)
+                        if not is_valid:
+                            st.error(f"⚠️ {msg}")
+                        else:
+                            ok, reset_msg = db_reset_password_with_token(demo_token, hash_password(f_new_pwd))
+                            if ok:
+                                st.session_state["active_demo_token"] = None
+                                st.session_state["reset_tab_completed"] = True
+                                st.rerun()
+                            else:
+                                st.error(f"❌ {reset_msg}")
+            with col_dismiss:
+                if st.button("Cancel", key="btn_forgot_direct_cancel", use_container_width=True):
+                    st.session_state["active_demo_token"] = None
+                    st.rerun()
+
+        if st.session_state.get("reset_tab_completed"):
+            st.success("🎉 Your password has been successfully updated! You can now log in.")
+            if st.button("Sign In Now", key="btn_after_tab_reset_done", use_container_width=True):
+                st.session_state["reset_tab_completed"] = False
+                st.rerun()
 
 # =============================
 # MAIN APPLICATION PAGE
