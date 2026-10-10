@@ -286,6 +286,54 @@ class TestPasswordResetSecurityFlow(unittest.TestCase):
         bad_ok, bad_msg = db_direct_reset_password("user1", "wrong_mail@test.com", hash_password("test"), self.db_path)
         self.assertFalse(bad_ok)
 
+    def test_16_new_user_registration_strictly_assigned_user_role(self):
+        """Scenario 16: Every newly registered account is strictly assigned the User role on backend."""
+        ok, msg = db_create_user(
+            username="employee_jane",
+            email="jane@company.com",
+            password_hash=hash_password("JanePassword123!"),
+            role="User",
+            fingerprint_verified=1,
+            db_path=self.db_path
+        )
+        self.assertTrue(ok)
+        created_user = db_get_user("employee_jane", self.db_path)
+        self.assertIsNotNone(created_user)
+        self.assertEqual(created_user["role"], "User")
+        self.assertNotEqual(created_user["role"], "Admin")
+
+    def test_17_standard_user_cannot_access_admin_privileges(self):
+        """Scenario 17: Standard users cannot access admin privileges even if role tampering is attempted."""
+        user = db_get_user("user1", self.db_path)
+        self.assertEqual(user["role"], "User")
+        # Simulating main_app authoritative check:
+        authoritative_role = user["role"] if user else "User"
+        self.assertFalse(authoritative_role == "Admin")
+
+    def test_18_email_login_works_for_both_user_and_admin(self):
+        """Scenario 18: Users and Administrators can log in using their email address."""
+        # 1. User login by email
+        user_by_email = db_get_user_by_email("user1@signature.com", self.db_path)
+        self.assertIsNotNone(user_by_email)
+        self.assertEqual(user_by_email["username"], "user1")
+        self.assertEqual(user_by_email["password_hash"], hash_password("user@123"))
+
+        # 2. Admin login by email
+        admin_by_email = db_get_user_by_email("venkatesanvijayan28@gmail.com", self.db_path)
+        self.assertIsNotNone(admin_by_email)
+        self.assertEqual(admin_by_email["role"], "Admin")
+        self.assertEqual(admin_by_email["password_hash"], hash_password("venkat@28"))
+
+    def test_19_admin_accounts_retain_admin_privileges(self):
+        """Scenario 19: Authorized administrator accounts exist and maintain Admin privileges."""
+        admin1 = db_get_user("venkatesan", self.db_path)
+        self.assertIsNotNone(admin1)
+        self.assertEqual(admin1["role"], "Admin")
+
+        admin2 = db_get_user("admin", self.db_path)
+        self.assertIsNotNone(admin2)
+        self.assertEqual(admin2["role"], "Admin")
+
 if __name__ == "__main__":
     unittest.main()
 

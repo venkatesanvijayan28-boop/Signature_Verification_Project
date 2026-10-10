@@ -193,7 +193,7 @@ def login_page():
     # 1. User Sign In
     with tab_user:
         st.markdown("### 👤 User Sign In")
-        u_username = st.text_input("Username", key="u_login_user")
+        u_username = st.text_input("Username or Email Address", key="u_login_user")
         u_password = st.text_input("Password", type="password", key="u_login_pass")
         u_2fa = st.checkbox("Two-Factor / Biometric Authentication Verified (Sensor OK)", value=True, key="u_login_2fa")
 
@@ -201,29 +201,29 @@ def login_page():
             if not u_2fa:
                 st.error("⚠️ Two-Factor / Biometric verification is required to sign in.")
             else:
-                user_info = db_get_user(u_username)
+                user_info = db_get_user(u_username) or db_get_user_by_email(u_username)
                 if user_info and user_info["password_hash"] == hash_password(u_password):
                     st.session_state.logged_in = True
-                    st.session_state.username = u_username
+                    st.session_state.username = user_info["username"]
                     st.session_state.role = user_info["role"]
                     st.success("✅ Authentication successful!")
                     st.rerun()
                 else:
-                    st.error("❌ Invalid username or password.")
+                    st.error("❌ Invalid username, email, or password.")
 
     # 2. Admin Sign In
     with tab_admin:
         st.markdown("### 🛡️ Admin Sign In")
         st.caption("Restricted access for administrative accounts.")
-        a_username = st.text_input("Admin Username", key="a_login_user")
+        a_username = st.text_input("Admin Username or Email", key="a_login_user")
         a_password = st.text_input("Admin Password", type="password", key="a_login_pass")
 
         if st.button("Sign In as Admin", key="btn_a_login", use_container_width=True):
-            user_info = db_get_user(a_username)
+            user_info = db_get_user(a_username) or db_get_user_by_email(a_username)
             if user_info and user_info["password_hash"] == hash_password(a_password):
                 if user_info["role"] == "Admin":
                     st.session_state.logged_in = True
-                    st.session_state.username = a_username
+                    st.session_state.username = user_info["username"]
                     st.session_state.role = "Admin"
                     st.success("✅ Admin credentials verified!")
                     st.rerun()
@@ -301,7 +301,9 @@ def login_page():
 # ==============================================================================
 def main_app():
     user_name = st.session_state.get("username", "User")
-    user_role = st.session_state.get("role", "User")
+    # Authoritative role verification from database prevents session state escalation
+    db_rec = db_get_user(user_name)
+    user_role = db_rec["role"] if db_rec else "User"
 
     # Navigation & Header
     header_col1, header_col2 = st.columns([3, 1])
