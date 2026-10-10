@@ -3,7 +3,15 @@ import re
 import hashlib
 import secrets
 import sqlite3
+import urllib.parse
 from datetime import datetime, timezone, timedelta
+
+try:
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+    HAS_PSYCOPG2 = True
+except ImportError:
+    HAS_PSYCOPG2 = False
 
 try:
     from supabase import create_client, Client
@@ -13,9 +21,38 @@ except ImportError:
 
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "signature_system.db")
 
-# Default Supabase Credentials (configurable via st.secrets or environment variables)
+# =============================
+# Supabase & PostgreSQL Credentials
+# =============================
 DEFAULT_SUPABASE_URL = "https://lxudtklogmuoypkpaovc.supabase.co"
 DEFAULT_SUPABASE_KEY = "sb_publishable_odJu-vWFQ9Ujjgk-CUTBLA_frCe3Qv5"
+
+DEFAULT_PG_PASSWORD = "$$Venkat@28$$"
+ENCODED_PG_PASSWORD = urllib.parse.quote_plus(DEFAULT_PG_PASSWORD)
+DEFAULT_POSTGRES_URL = f"postgresql://postgres:{ENCODED_PG_PASSWORD}@db.lxudtklogmuoypkpaovc.supabase.co:5432/postgres"
+
+def get_postgres_url() -> str:
+    """Returns the PostgreSQL connection string with password properly encoded."""
+    url = None
+    try:
+        import streamlit as st
+        url = st.secrets.get("DATABASE_URL") or st.secrets.get("POSTGRES_URL")
+    except Exception:
+        pass
+    if not url:
+        url = os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL", DEFAULT_POSTGRES_URL)
+    return url
+
+def get_postgres_connection():
+    """Attempts direct connection to Supabase PostgreSQL database."""
+    if not HAS_PSYCOPG2:
+        return None
+    url = get_postgres_url()
+    try:
+        conn = psycopg2.connect(url, cursor_factory=RealDictCursor, connect_timeout=3)
+        return conn
+    except Exception:
+        return None
 
 def get_supabase_client():
     """Initializes and returns a Supabase client using secrets, environment vars, or defaults."""
@@ -76,18 +113,19 @@ def supabase_verify_otp_and_reset(email: str, token: str, new_password: str):
     if not client:
         return False, "Supabase client not available."
     try:
-        # Verify recovery OTP/token
-        verify_res = client.auth.verify_otp({
+        client.auth.verify_otp({
             "email": email.strip(),
             "token": token.strip(),
             "type": "recovery"
         })
-        # Update user password in Supabase
-        update_res = client.auth.update_user({"password": new_password})
+        client.auth.update_user({"password": new_password})
         return True, "Password updated in Supabase successfully."
     except Exception as exc:
         return False, str(exc)
 
+# =============================
+# Local SQLite & Helper Methods
+# =============================
 def get_db_connection(db_path: str = None):
     target = db_path or DB_FILE
     conn = sqlite3.connect(target, check_same_thread=False)
@@ -120,11 +158,11 @@ def generate_reset_token() -> str:
     return secrets.token_urlsafe(32)
 
 def init_db(db_path: str = None):
-    """Initializes SQLite tables for users and password reset tokens."""
+    """Initializes tables in both Supabase PostgreSQL and local SQLite."""
+    # 1. Initialize SQLite
     conn = get_db_connection(db_path)
     cursor = conn.cursor()
 
-    # Users table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
             username TEXT PRIMARY KEY,
@@ -136,7 +174,6 @@ def init_db(db_path: str = None):
         )
     """)
 
-    # Secure Password Reset Tokens table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS password_reset_tokens (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -151,7 +188,6 @@ def init_db(db_path: str = None):
     """)
     conn.commit()
 
-    # Seed default accounts if users table is empty
     cursor.execute("SELECT COUNT(*) FROM users")
     if cursor.fetchone()[0] == 0:
         cursor.execute(
@@ -168,7 +204,6 @@ def init_db(db_path: str = None):
         )
         conn.commit()
     else:
-        # Keep default admin email synchronized
         cursor.execute(
             "UPDATE users SET email = ? WHERE username = ? AND email != ?",
             ("venkatesanvijayan28@gmail.com", "venkatesan", "venkatesanvijayan28@gmail.com")
@@ -177,8 +212,61 @@ def init_db(db_path: str = None):
 
     conn.close()
 
+    # 2. Try initializing Supabase PostgreSQL if accessible
+    if not db_path:
+        pg_conn = get_postgres_connection()
+        if pg_conn:
+            try:
+                with pg_conn:
+                    cur = pg_conn.cursor()
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS users (
+                            username TEXT PRIMARY KEY,
+                            email TEXT NOT NULL,
+                            password_hash TEXT NOT NULL,
+                            role TEXT NOT NULL,
+                            fingerprint_verified INTEGER DEFAULT 1,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        );
+                    """)
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS password_reset_tokens (
+                            id SERIAL PRIMARY KEY,
+                            username TEXT NOT NULL,
+                            email TEXT NOT NULL,
+                            token_hash TEXT NOT NULL UNIQUE,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            expires_at TIMESTAMP NOT NULL,
+                            is_used INTEGER DEFAULT 0,
+                            is_revoked INTEGER DEFAULT 0
+                        );
+                    """)
+                    cur.execute("SELECT COUNT(*) FROM users;")
+                    res = cur.fetchone()
+                    if res and res.get('count', 0) == 0:
+                        cur.execute(
+                            "INSERT INTO users (username, email, password_hash, role, fingerprint_verified) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING;",
+                            ("venkatesan", "venkatesanvijayan28@gmail.com", hash_password("venkat@28"), "Admin", 1)
+                        )
+                pg_conn.close()
+            except Exception:
+                pass
+
 def db_get_user(username: str, db_path: str = None):
-    """Fetches user record by username."""
+    """Fetches user record by username from PostgreSQL or SQLite."""
+    if not db_path:
+        pg_conn = get_postgres_connection()
+        if pg_conn:
+            try:
+                cur = pg_conn.cursor()
+                cur.execute("SELECT * FROM users WHERE username = %s;", (username.strip(),))
+                row = cur.fetchone()
+                pg_conn.close()
+                if row:
+                    return dict(row)
+            except Exception:
+                pass
+
     conn = get_db_connection(db_path)
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM users WHERE username = ?", (username.strip(),))
@@ -187,7 +275,20 @@ def db_get_user(username: str, db_path: str = None):
     return dict(row) if row else None
 
 def db_get_user_by_email(email: str, db_path: str = None):
-    """Fetches user record by email (case-insensitive)."""
+    """Fetches user record by email (case-insensitive) from PostgreSQL or SQLite."""
+    if not db_path:
+        pg_conn = get_postgres_connection()
+        if pg_conn:
+            try:
+                cur = pg_conn.cursor()
+                cur.execute("SELECT * FROM users WHERE LOWER(email) = LOWER(%s);", (email.strip(),))
+                row = cur.fetchone()
+                pg_conn.close()
+                if row:
+                    return dict(row)
+            except Exception:
+                pass
+
     conn = get_db_connection(db_path)
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM users WHERE LOWER(email) = LOWER(?)", (email.strip(),))
@@ -204,7 +305,23 @@ def db_get_user_by_email_or_username(identifier: str, db_path: str = None):
     return user
 
 def db_create_user(username: str, email: str, password_hash: str, role: str, fingerprint_verified: int = 1, raw_password: str = None, db_path: str = None):
-    """Creates a new user record in the database and auto-syncs with Supabase."""
+    """Creates user in PostgreSQL, SQLite, and auto-syncs with Supabase Auth."""
+    # 1. Sync to PostgreSQL if available
+    if not db_path:
+        pg_conn = get_postgres_connection()
+        if pg_conn:
+            try:
+                with pg_conn:
+                    cur = pg_conn.cursor()
+                    cur.execute(
+                        "INSERT INTO users (username, email, password_hash, role, fingerprint_verified) VALUES (%s, %s, %s, %s, %s);",
+                        (username.strip(), email.strip(), password_hash, role, fingerprint_verified)
+                    )
+                pg_conn.close()
+            except Exception:
+                pass
+
+    # 2. Save in SQLite
     conn = get_db_connection(db_path)
     cursor = conn.cursor()
     try:
@@ -213,12 +330,14 @@ def db_create_user(username: str, email: str, password_hash: str, role: str, fin
             (username.strip(), email.strip(), password_hash, role, fingerprint_verified)
         )
         conn.commit()
-        # Auto-sync to Supabase if raw password provided
+
+        # 3. Auto-sync to Supabase Auth if raw password provided
         if raw_password:
             try:
                 supabase_sync_user(email, raw_password, username, role, fingerprint_verified)
             except Exception:
                 pass
+
         return True, "User registered successfully."
     except sqlite3.IntegrityError:
         return False, f"Username '{username}' already exists in database."
@@ -226,7 +345,18 @@ def db_create_user(username: str, email: str, password_hash: str, role: str, fin
         conn.close()
 
 def db_update_password(username: str, new_password_hash: str, db_path: str = None):
-    """Updates password hash for a specific user."""
+    """Updates password hash in both PostgreSQL and SQLite."""
+    if not db_path:
+        pg_conn = get_postgres_connection()
+        if pg_conn:
+            try:
+                with pg_conn:
+                    cur = pg_conn.cursor()
+                    cur.execute("UPDATE users SET password_hash = %s WHERE username = %s;", (new_password_hash, username.strip()))
+                pg_conn.close()
+            except Exception:
+                pass
+
     conn = get_db_connection(db_path)
     cursor = conn.cursor()
     cursor.execute("UPDATE users SET password_hash = ? WHERE username = ?", (new_password_hash, username.strip()))
@@ -243,12 +373,10 @@ def db_create_reset_token(username: str, email: str, raw_token: str, valid_minut
     try:
         with conn:
             cursor = conn.cursor()
-            # Invalidate prior outstanding tokens for this user
             cursor.execute(
                 "UPDATE password_reset_tokens SET is_revoked = 1 WHERE username = ? AND is_used = 0 AND is_revoked = 0",
                 (username.strip(),)
             )
-            # Insert the new token hash
             cursor.execute(
                 "INSERT INTO password_reset_tokens (username, email, token_hash, expires_at, is_used, is_revoked) VALUES (?, ?, ?, ?, 0, 0)",
                 (username.strip(), email.strip(), thash, expires_at)
@@ -326,7 +454,7 @@ def db_reset_password_with_token(raw_token: str, new_password_hash: str, db_path
                 return False, "This password reset token has expired."
 
             username = record["username"]
-            # 1. Update user password
+            # 1. Update user password in SQLite
             cursor.execute("UPDATE users SET password_hash = ? WHERE username = ?", (new_password_hash, username))
             # 2. Mark this token as used
             cursor.execute("UPDATE password_reset_tokens SET is_used = 1 WHERE id = ?", (record["id"],))
@@ -335,6 +463,19 @@ def db_reset_password_with_token(raw_token: str, new_password_hash: str, db_path
                 "UPDATE password_reset_tokens SET is_revoked = 1 WHERE username = ? AND id != ?",
                 (username, record["id"])
             )
+
+        # Also sync password update to PostgreSQL if connected
+        if not db_path:
+            pg_conn = get_postgres_connection()
+            if pg_conn:
+                try:
+                    with pg_conn:
+                        cur = pg_conn.cursor()
+                        cur.execute("UPDATE users SET password_hash = %s WHERE username = %s;", (new_password_hash, username))
+                    pg_conn.close()
+                except Exception:
+                    pass
+
         return True, "Password reset successfully."
     except Exception as exc:
         return False, str(exc)

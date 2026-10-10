@@ -5,3 +5,4 @@ tensorflow-cpu==2.20.0
 keras==3.13.0
 requests==2.32.5
 supabase==2.31.0
+psycopg2-binary==2.9.9
