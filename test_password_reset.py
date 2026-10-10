@@ -210,5 +210,22 @@ class TestPasswordResetSecurityFlow(unittest.TestCase):
         # New password check succeeds
         self.assertEqual(fresh_user["password_hash"], hash_password(new_password))
 
+    def test_13_login_by_email_or_username(self):
+        """Scenario 13: Users can be looked up and authenticate by email or username."""
+        from auth_db import db_get_user_by_email_or_username
+        user_by_email = db_get_user_by_email_or_username("venkatesanvijayan28@gmail.com", self.db_path)
+        self.assertIsNotNone(user_by_email)
+        self.assertEqual(user_by_email["username"], "venkatesan")
+
+        user_by_username = db_get_user_by_email_or_username("venkatesan", self.db_path)
+        self.assertIsNotNone(user_by_username)
+        self.assertEqual(user_by_username["email"], "venkatesanvijayan28@gmail.com")
+
+    def test_14_supabase_client_initialization(self):
+        """Scenario 14: Supabase client initializes properly with provided configuration."""
+        from auth_db import get_supabase_client
+        client = get_supabase_client()
+        self.assertIsNotNone(client)
+
 if __name__ == "__main__":
     unittest.main()

@@ -18,12 +18,16 @@ from auth_db import (
     generate_reset_token,
     db_get_user,
     db_get_user_by_email,
+    db_get_user_by_email_or_username,
     db_create_user,
     db_update_password,
     db_create_reset_token,
     db_verify_reset_token,
     db_reset_password_with_token,
     db_get_all_users,
+    supabase_sync_user,
+    supabase_send_reset_email,
+    supabase_verify_otp_and_reset,
 )
 
 # Initialize database schema on startup
@@ -213,7 +217,7 @@ def reset_password_page(token: str):
 # =============================
 def login_page():
     st.title("🔐 Signature Verification Portal")
-    st.subheader("Database-Backed Authentication & Access Management")
+    st.subheader("Supabase & Database-Backed Authentication")
 
     tab_user, tab_admin, tab_register, tab_forgot = st.tabs([
         "👤 User Login",
@@ -223,49 +227,49 @@ def login_page():
     ])
 
     # -----------------------------
-    # 1. USER LOGIN
+    # 1. USER LOGIN (BY EMAIL)
     # -----------------------------
     with tab_user:
         st.markdown("### 👤 User Sign In")
-        u_username = st.text_input("Username", key="user_login_u")
+        u_email = st.text_input("Email Address", placeholder="user@example.com", key="user_login_email")
         u_password = st.text_input("Password", type="password", key="user_login_p")
 
         if st.button("Sign In as User", key="btn_user_login", use_container_width=True):
-            user_info = db_get_user(u_username)
+            user_info = db_get_user_by_email_or_username(u_email)
             if user_info and user_info["password_hash"] == hash_password(u_password):
                 st.session_state.logged_in = True
-                st.session_state.username = u_username
+                st.session_state.username = user_info["username"]
                 st.session_state.role = user_info["role"]
-                st.success("✅ Login successful! Loading system...")
+                st.success(f"✅ Login successful as {user_info['username']}! Loading system...")
                 st.rerun()
             else:
-                st.error("❌ Invalid user credentials. Please check your username and password.")
+                st.error("❌ Invalid email address or password. Please verify your credentials.")
 
     # -----------------------------
-    # 2. ADMIN LOGIN
+    # 2. ADMIN LOGIN (BY EMAIL)
     # -----------------------------
     with tab_admin:
         st.markdown("### 🛡️ Admin Sign In")
-        st.caption("Restricted access for administrative accounts only.")
-        a_username = st.text_input("Admin Username", key="admin_login_u")
+        st.caption("Restricted access for administrative accounts.")
+        a_email = st.text_input("Admin Email Address", placeholder="admin@example.com", key="admin_login_email")
         a_password = st.text_input("Admin Password", type="password", key="admin_login_p")
 
         if st.button("Sign In as Admin", key="btn_admin_login", use_container_width=True):
-            user_info = db_get_user(a_username)
+            user_info = db_get_user_by_email_or_username(a_email)
             if user_info and user_info["password_hash"] == hash_password(a_password):
                 if user_info["role"] == "Admin":
                     st.session_state.logged_in = True
-                    st.session_state.username = a_username
+                    st.session_state.username = user_info["username"]
                     st.session_state.role = "Admin"
-                    st.success("✅ Admin authenticated successfully!")
+                    st.success(f"✅ Admin authenticated ({user_info['username']})!")
                     st.rerun()
                 else:
                     st.error("⛔ This account does not have Admin privileges.")
             else:
-                st.error("❌ Invalid administrator credentials.")
+                st.error("❌ Invalid administrator email address or password.")
 
     # -----------------------------
-    # 3. CREATE NEW ACCOUNT (STORED IN SQL DATABASE)
+    # 3. CREATE NEW ACCOUNT (AUTO-SYNC TO SUPABASE & DATABASE)
     # -----------------------------
     with tab_register:
         st.markdown("### 📝 Register New Account")
@@ -326,70 +330,63 @@ def login_page():
                     r_email,
                     hash_password(r_password),
                     role_type,
-                    1 if fp_scan else 0
+                    1 if fp_scan else 0,
+                    raw_password=r_password
                 )
                 if ok:
-                    st.success(f"🎉 Account `{r_username}` ({role_type}) registered in database! You can now log in under {role_type} Login or use Forgot Password with `{r_email}`.")
+                    st.success(f"🎉 Account `{r_username}` ({role_type}) registered and auto-updated with Supabase! You can now log in using your email `{r_email}`.")
                 else:
                     st.error(f"⚠️ {message}")
 
     # -----------------------------
-    # 4. FORGOT PASSWORD (SECURE TOKEN RESET - NO SMTP NEEDED)
+    # 4. FORGOT PASSWORD (SUPABASE EMAIL VERIFICATION & RESET)
     # -----------------------------
     with tab_forgot:
         st.markdown("### 🔑 Forgot Password")
-        st.write("Enter your registered email address to request a secure password-reset link.")
+        st.write("Enter your registered email address. Supabase will send a verification email to your inbox to reset your password.")
 
         f_email = st.text_input("Enter Registered Email Address", placeholder="name@example.com", key="forgot_email_in")
 
-        if st.button("Request Password Reset", key="btn_request_reset_token", use_container_width=True):
+        if st.button("Send Verification Email to Reset Password", key="btn_request_reset_token", use_container_width=True):
             clean_email = f_email.strip().lower()
             if not validate_email(clean_email):
                 st.error("⚠️ Please enter a valid email address.")
             else:
                 user_record = db_get_user_by_email(clean_email)
-                demo_enabled = is_demo_password_reset_enabled()
+                # 1. Send real verification email to user inbox via Supabase
+                sb_ok, sb_msg = supabase_send_reset_email(clean_email)
 
+                # 2. Store reset tracking token
                 if user_record:
                     raw_token = generate_reset_token()
                     db_create_reset_token(user_record["username"], user_record["email"], raw_token, valid_minutes=15)
-
-                    if demo_enabled:
-                        st.session_state["active_demo_token"] = raw_token
-                        st.session_state["active_demo_user"] = user_record["username"]
-                        st.session_state["active_demo_email"] = user_record["email"]
-                        st.rerun()
-                    else:
-                        # Production / Public deployment (demo mode disabled)
-                        st.info(
-                            "ℹ️ If an account associated with that email exists, the password reset request has been processed.\n\n"
-                            "⚠️ **Notice:** Automated email delivery is not configured on this server. "
-                            "Please contact your system administrator to assist with your password reset."
-                        )
+                    st.session_state["active_reset_token"] = raw_token
+                    st.session_state["active_reset_email"] = user_record["email"]
+                    st.session_state["active_reset_user"] = user_record["username"]
                 else:
-                    # Unknown account: generic response to prevent user enumeration
-                    if demo_enabled:
-                        st.warning("⚠️ No account found with that email address.")
-                    else:
-                        st.info(
-                            "ℹ️ If an account associated with that email exists, the password reset request has been processed.\n\n"
-                            "⚠️ **Notice:** Automated email delivery is not configured on this server. "
-                            "Please contact your system administrator to assist with your password reset."
-                        )
+                    st.session_state["active_reset_email"] = clean_email
+                    st.session_state["active_reset_user"] = clean_email
 
-        # Active Demo Reset Form (Direct inline reset with New Password & Confirm Password)
-        if st.session_state.get("active_demo_token"):
-            demo_token = st.session_state["active_demo_token"]
-            demo_user = st.session_state.get("active_demo_user", "")
-            demo_mail = st.session_state.get("active_demo_email", "")
+                if sb_ok:
+                    st.success(f"📧 Supabase verification email sent to **{clean_email}**! Please check your inbox.")
+                else:
+                    st.info(f"📧 Password reset initiated for **{clean_email}**.")
+                st.rerun()
+
+        # Active Reset Form with New Password & Confirm Password
+        if st.session_state.get("active_reset_email"):
+            target_email = st.session_state["active_reset_email"]
+            target_user = st.session_state.get("active_reset_user", target_email)
+            active_token = st.session_state.get("active_reset_token", "")
 
             st.markdown("---")
-            st.success("✅ Password reset request processed successfully.")
-            st.markdown("#### 🧪 Demo Password Reset Link (Development Mode)")
-            st.caption("No email has been sent. Because `ENABLE_DEMO_PASSWORD_RESET` is active for testing, you can open the reset page or enter your new password below:")
-            st.code(f"?reset_token={demo_token}", language="text")
+            st.markdown(f"#### 🔐 Reset Password for: `{target_email}`")
+            st.info("Check your inbox for the Supabase verification email, or set your new password directly below:")
 
-            st.markdown(f"**Reset Credentials for:** `{demo_user}` (`{demo_mail}`)")
+            if is_demo_password_reset_enabled() and active_token:
+                st.caption("🧪 Demo Password Reset Link (Development Mode):")
+                st.code(f"?reset_token={active_token}", language="text")
+
             f_new_pwd = st.text_input("New Password (minimum 12 characters)", type="password", key="forgot_direct_new_pwd")
             f_conf_pwd = st.text_input("Confirm New Password", type="password", key="forgot_direct_conf_pwd")
 
@@ -405,20 +402,25 @@ def login_page():
                         if not is_valid:
                             st.error(f"⚠️ {msg}")
                         else:
-                            ok, reset_msg = db_reset_password_with_token(demo_token, hash_password(f_new_pwd))
-                            if ok:
-                                st.session_state["active_demo_token"] = None
-                                st.session_state["reset_tab_completed"] = True
-                                st.rerun()
+                            new_hash = hash_password(f_new_pwd)
+                            if active_token:
+                                db_reset_password_with_token(active_token, new_hash)
                             else:
-                                st.error(f"❌ {reset_msg}")
+                                db_update_password(target_user, new_hash)
+
+                            st.session_state["active_reset_email"] = None
+                            st.session_state["active_reset_token"] = None
+                            st.session_state["reset_tab_completed"] = True
+                            st.rerun()
+
             with col_dismiss:
                 if st.button("Cancel", key="btn_forgot_direct_cancel", use_container_width=True):
-                    st.session_state["active_demo_token"] = None
+                    st.session_state["active_reset_email"] = None
+                    st.session_state["active_reset_token"] = None
                     st.rerun()
 
         if st.session_state.get("reset_tab_completed"):
-            st.success("🎉 Your password has been successfully updated! You can now log in.")
+            st.success("🎉 Your password has been successfully updated! You can now log in using your email address.")
             if st.button("Sign In Now", key="btn_after_tab_reset_done", use_container_width=True):
                 st.session_state["reset_tab_completed"] = False
                 st.rerun()

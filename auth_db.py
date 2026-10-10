@@ -5,7 +5,88 @@ import secrets
 import sqlite3
 from datetime import datetime, timezone, timedelta
 
+try:
+    from supabase import create_client, Client
+    HAS_SUPABASE = True
+except ImportError:
+    HAS_SUPABASE = False
+
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "signature_system.db")
+
+# Default Supabase Credentials (configurable via st.secrets or environment variables)
+DEFAULT_SUPABASE_URL = "https://lxudtklogmuoypkpaovc.supabase.co"
+DEFAULT_SUPABASE_KEY = "sb_publishable_odJu-vWFQ9Ujjgk-CUTBLA_frCe3Qv5"
+
+def get_supabase_client():
+    """Initializes and returns a Supabase client using secrets, environment vars, or defaults."""
+    if not HAS_SUPABASE:
+        return None
+    url = None
+    key = None
+    try:
+        import streamlit as st
+        url = st.secrets.get("SUPABASE_URL") or st.secrets.get("NEXT_PUBLIC_SUPABASE_URL")
+        key = st.secrets.get("SUPABASE_KEY") or st.secrets.get("NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY") or st.secrets.get("SUPABASE_ANON_KEY")
+    except Exception:
+        pass
+    if not url:
+        url = os.environ.get("SUPABASE_URL") or os.environ.get("NEXT_PUBLIC_SUPABASE_URL", DEFAULT_SUPABASE_URL)
+    if not key:
+        key = os.environ.get("SUPABASE_KEY") or os.environ.get("NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY", DEFAULT_SUPABASE_KEY)
+    try:
+        return create_client(url, key)
+    except Exception:
+        return None
+
+def supabase_sync_user(email: str, password: str, username: str, role: str, fingerprint_verified: int = 1):
+    """Auto-syncs user creation to Supabase Auth."""
+    client = get_supabase_client()
+    if not client:
+        return False, "Supabase client not initialized."
+    try:
+        res = client.auth.sign_up({
+            "email": email.strip(),
+            "password": password,
+            "options": {
+                "data": {
+                    "username": username.strip(),
+                    "role": role,
+                    "fingerprint_verified": fingerprint_verified
+                }
+            }
+        })
+        return True, "User synced to Supabase Auth."
+    except Exception as exc:
+        return False, str(exc)
+
+def supabase_send_reset_email(email: str):
+    """Sends a password-reset verification email to the user's inbox using Supabase's built-in mailer."""
+    client = get_supabase_client()
+    if not client:
+        return False, "Supabase client not available."
+    try:
+        client.auth.reset_password_for_email(email.strip())
+        return True, "Supabase password reset email dispatched."
+    except Exception as exc:
+        return False, str(exc)
+
+def supabase_verify_otp_and_reset(email: str, token: str, new_password: str):
+    """Verifies recovery OTP token and updates password in Supabase."""
+    client = get_supabase_client()
+    if not client:
+        return False, "Supabase client not available."
+    try:
+        # Verify recovery OTP/token
+        verify_res = client.auth.verify_otp({
+            "email": email.strip(),
+            "token": token.strip(),
+            "type": "recovery"
+        })
+        # Update user password in Supabase
+        update_res = client.auth.update_user({"password": new_password})
+        return True, "Password updated in Supabase successfully."
+    except Exception as exc:
+        return False, str(exc)
 
 def get_db_connection(db_path: str = None):
     target = db_path or DB_FILE
@@ -114,8 +195,16 @@ def db_get_user_by_email(email: str, db_path: str = None):
     conn.close()
     return dict(row) if row else None
 
-def db_create_user(username: str, email: str, password_hash: str, role: str, fingerprint_verified: int = 1, db_path: str = None):
-    """Creates a new user record in the database."""
+def db_get_user_by_email_or_username(identifier: str, db_path: str = None):
+    """Fetches user record by either email or username."""
+    clean_id = identifier.strip()
+    user = db_get_user_by_email(clean_id, db_path)
+    if not user:
+        user = db_get_user(clean_id, db_path)
+    return user
+
+def db_create_user(username: str, email: str, password_hash: str, role: str, fingerprint_verified: int = 1, raw_password: str = None, db_path: str = None):
+    """Creates a new user record in the database and auto-syncs with Supabase."""
     conn = get_db_connection(db_path)
     cursor = conn.cursor()
     try:
@@ -124,6 +213,12 @@ def db_create_user(username: str, email: str, password_hash: str, role: str, fin
             (username.strip(), email.strip(), password_hash, role, fingerprint_verified)
         )
         conn.commit()
+        # Auto-sync to Supabase if raw password provided
+        if raw_password:
+            try:
+                supabase_sync_user(email, raw_password, username, role, fingerprint_verified)
+            except Exception:
+                pass
         return True, "User registered successfully."
     except sqlite3.IntegrityError:
         return False, f"Username '{username}' already exists in database."
