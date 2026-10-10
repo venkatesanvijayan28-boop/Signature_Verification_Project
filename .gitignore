@@ -19,8 +19,15 @@ venv/
 ENV/
 env/
 
-# Streamlit secrets and local caches
+# Secrets, environment, and credential files
 .streamlit/secrets.toml
+secrets.toml
+.env
+.env.*
+*.env
+*.secret
+
+# Local database and cache files
 .model_cache/
 users_db.json
 *.db

@@ -222,10 +222,62 @@ class TestPasswordResetSecurityFlow(unittest.TestCase):
         self.assertEqual(user_by_username["email"], "venkatesanvijayan28@gmail.com")
 
     def test_14_supabase_client_initialization(self):
-        """Scenario 14: Supabase client initializes properly with provided configuration."""
+        """Scenario 14: Supabase client helper handles configuration cleanly without crashing."""
         from auth_db import get_supabase_client
+        # When no credentials are configured, safely returns None instead of raising an unhandled exception
         client = get_supabase_client()
-        self.assertIsNotNone(client)
+        # Clean safe return
+        self.assertTrue(client is None or hasattr(client, "auth"))
+
+    def test_15_no_hardcoded_database_credentials(self):
+        """Scenario 15: Verify auth_db.py contains no hardcoded database passwords or credential URLs."""
+        auth_db_path = os.path.join(os.path.dirname(__file__), "auth_db.py")
+        with open(auth_db_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        # Check for specific previously committed passwords or patterns
+        self.assertNotIn("$$Venkat@28$$", content)
+        self.assertNotIn("DEFAULT_PG_PASSWORD", content)
+        self.assertNotIn("sb_publishable_", content)
+
+    def test_16_postgres_authoritative_fails_fast_on_error(self):
+        """Scenario 16: Verify that when PostgreSQL is authoritative and unreachable, it raises DatabaseConnectionError and does not silently fall back."""
+        from auth_db import (
+            is_postgres_authoritative,
+            get_postgres_connection,
+            DatabaseConnectionError
+        )
+        old_url = os.environ.get("DATABASE_URL")
+        try:
+            os.environ["DATABASE_URL"] = "postgresql://postgres:test@127.0.0.1:5432/postgres"
+            self.assertTrue(is_postgres_authoritative())
+            with self.assertRaises(DatabaseConnectionError):
+                get_postgres_connection()
+        finally:
+            if old_url is not None:
+                os.environ["DATABASE_URL"] = old_url
+    def test_17_supabase_recovery_syncs_to_database(self):
+        """Scenario 17: Verify Supabase Auth recovery syncs updated password to database."""
+        from unittest.mock import MagicMock, patch
+        from auth_db import supabase_verify_otp_and_reset, db_get_user, hash_password
+
+        # Mock Supabase client
+        mock_client = MagicMock()
+        mock_client.auth.verify_otp.return_value = {"session": None}
+        mock_client.auth.update_user.return_value = {"user": None}
+
+        with patch("auth_db.get_supabase_client", return_value=mock_client):
+            new_plain_pwd = "NewSupabaseSecurePassword2026!"
+            ok, msg = supabase_verify_otp_and_reset(
+                "venkatesanvijayan28@gmail.com",
+                "123456",
+                new_plain_pwd,
+                db_path=self.db_path
+            )
+            self.assertTrue(ok)
+            # Verify database user has the updated password hash
+            user = db_get_user("venkatesan", db_path=self.db_path)
+            self.assertEqual(user["password_hash"], hash_password(new_plain_pwd))
 
 if __name__ == "__main__":
     unittest.main()

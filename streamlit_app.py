@@ -28,10 +28,17 @@ from auth_db import (
     supabase_sync_user,
     supabase_send_reset_email,
     supabase_verify_otp_and_reset,
+    DatabaseConnectionError,
+    DatabaseError,
+    is_postgres_authoritative,
 )
 
-# Initialize database schema on startup
-init_db()
+# Safe database initialization on startup
+db_init_error = None
+try:
+    init_db()
+except Exception as exc:
+    db_init_error = str(exc)
 
 # =============================
 # Streamlit Page Configuration
@@ -174,7 +181,15 @@ def reset_password_page(token: str):
             st.rerun()
         return
 
-    record, err = db_verify_reset_token(token)
+    try:
+        record, err = db_verify_reset_token(token)
+    except DatabaseConnectionError as conn_err:
+        st.error(f"❌ Database Connection Error: {conn_err}")
+        if st.button("Return to Sign In", key="btn_return_login_after_conn_err", use_container_width=True):
+            st.query_params.clear()
+            st.rerun()
+        return
+
     if err:
         st.error(f"❌ {err}")
         st.info("The reset link may have expired (15-minute validity), already been used, or been invalidated by a newer request.")
@@ -200,12 +215,17 @@ def reset_password_page(token: str):
                 if not is_valid:
                     st.error(f"⚠️ {msg}")
                 else:
-                    success, reset_msg = db_reset_password_with_token(token, hash_password(new_password))
-                    if success:
-                        st.session_state.password_reset_success = True
-                        st.rerun()
-                    else:
-                        st.error(f"❌ {reset_msg}")
+                    try:
+                        success, reset_msg = db_reset_password_with_token(token, hash_password(new_password))
+                        if success:
+                            st.session_state.password_reset_success = True
+                            st.rerun()
+                        else:
+                            st.error(f"❌ {reset_msg}")
+                    except DatabaseConnectionError as conn_err:
+                        st.error(f"❌ Database Connection Error: {conn_err}")
+                    except Exception as exc:
+                        st.error(f"❌ Password Reset Error: {exc}")
 
     with col_cancel:
         if st.button("Cancel & Return to Login", key="btn_cancel_pw_reset", use_container_width=True):
@@ -218,6 +238,10 @@ def reset_password_page(token: str):
 def login_page():
     st.title("🔐 Signature Verification Portal")
     st.subheader("Supabase & Database-Backed Authentication")
+
+    if db_init_error:
+        st.error(f"❌ Database Connection Error: {db_init_error}")
+        st.warning("⚠️ The authoritative database is unreachable. Please verify your DATABASE_URL in Streamlit Cloud Secrets.")
 
     tab_user, tab_admin, tab_register, tab_forgot = st.tabs([
         "👤 User Login",
@@ -235,15 +259,20 @@ def login_page():
         u_password = st.text_input("Password", type="password", key="user_login_p")
 
         if st.button("Sign In as User", key="btn_user_login", use_container_width=True):
-            user_info = db_get_user_by_email_or_username(u_email)
-            if user_info and user_info["password_hash"] == hash_password(u_password):
-                st.session_state.logged_in = True
-                st.session_state.username = user_info["username"]
-                st.session_state.role = user_info["role"]
-                st.success(f"✅ Login successful as {user_info['username']}! Loading system...")
-                st.rerun()
-            else:
-                st.error("❌ Invalid email address or password. Please verify your credentials.")
+            try:
+                user_info = db_get_user_by_email_or_username(u_email)
+                if user_info and user_info["password_hash"] == hash_password(u_password):
+                    st.session_state.logged_in = True
+                    st.session_state.username = user_info["username"]
+                    st.session_state.role = user_info["role"]
+                    st.success(f"✅ Login successful as {user_info['username']}! Loading system...")
+                    st.rerun()
+                else:
+                    st.error("❌ Invalid email address or password. Please verify your credentials.")
+            except DatabaseConnectionError as conn_err:
+                st.error(f"❌ Database Connection Error: {conn_err}")
+            except Exception as exc:
+                st.error(f"❌ Authentication Error: {exc}")
 
     # -----------------------------
     # 2. ADMIN LOGIN (BY EMAIL)
@@ -255,18 +284,23 @@ def login_page():
         a_password = st.text_input("Admin Password", type="password", key="admin_login_p")
 
         if st.button("Sign In as Admin", key="btn_admin_login", use_container_width=True):
-            user_info = db_get_user_by_email_or_username(a_email)
-            if user_info and user_info["password_hash"] == hash_password(a_password):
-                if user_info["role"] == "Admin":
-                    st.session_state.logged_in = True
-                    st.session_state.username = user_info["username"]
-                    st.session_state.role = "Admin"
-                    st.success(f"✅ Admin authenticated ({user_info['username']})!")
-                    st.rerun()
+            try:
+                user_info = db_get_user_by_email_or_username(a_email)
+                if user_info and user_info["password_hash"] == hash_password(a_password):
+                    if user_info["role"] == "Admin":
+                        st.session_state.logged_in = True
+                        st.session_state.username = user_info["username"]
+                        st.session_state.role = "Admin"
+                        st.success(f"✅ Admin authenticated ({user_info['username']})!")
+                        st.rerun()
+                    else:
+                        st.error("⛔ This account does not have Admin privileges.")
                 else:
-                    st.error("⛔ This account does not have Admin privileges.")
-            else:
-                st.error("❌ Invalid administrator email address or password.")
+                    st.error("❌ Invalid administrator email address or password.")
+            except DatabaseConnectionError as conn_err:
+                st.error(f"❌ Database Connection Error: {conn_err}")
+            except Exception as exc:
+                st.error(f"❌ Authentication Error: {exc}")
 
     # -----------------------------
     # 3. CREATE NEW ACCOUNT (AUTO-SYNC TO SUPABASE & DATABASE)
@@ -325,18 +359,23 @@ def login_page():
             elif role_type == "Admin" and admin_secret not in ["ADMIN@2026", "admin@123", "venkat@28", "ADMIN2026"]:
                 st.error("⛔ Invalid Admin Master Passcode. Use `ADMIN@2026` or contact system owner.")
             else:
-                ok, message = db_create_user(
-                    r_username,
-                    r_email,
-                    hash_password(r_password),
-                    role_type,
-                    1 if fp_scan else 0,
-                    raw_password=r_password
-                )
-                if ok:
-                    st.success(f"🎉 Account `{r_username}` ({role_type}) registered and auto-updated with Supabase! You can now log in using your email `{r_email}`.")
-                else:
-                    st.error(f"⚠️ {message}")
+                try:
+                    ok, message = db_create_user(
+                        r_username,
+                        r_email,
+                        hash_password(r_password),
+                        role_type,
+                        1 if fp_scan else 0,
+                        raw_password=r_password
+                    )
+                    if ok:
+                        st.success(f"🎉 Account `{r_username}` ({role_type}) registered in authoritative database! You can now log in using your email `{r_email}`.")
+                    else:
+                        st.error(f"⚠️ {message}")
+                except DatabaseConnectionError as conn_err:
+                    st.error(f"❌ Registration Failed (Database Connection Error): {conn_err}")
+                except Exception as exc:
+                    st.error(f"❌ Registration Error: {exc}")
 
     # -----------------------------
     # 4. FORGOT PASSWORD (SUPABASE EMAIL VERIFICATION & RESET)
@@ -352,26 +391,31 @@ def login_page():
             if not validate_email(clean_email):
                 st.error("⚠️ Please enter a valid email address.")
             else:
-                user_record = db_get_user_by_email(clean_email)
-                # 1. Send real verification email to user inbox via Supabase
-                sb_ok, sb_msg = supabase_send_reset_email(clean_email)
+                try:
+                    user_record = db_get_user_by_email(clean_email)
+                    # 1. Send real verification email via Supabase if configured
+                    sb_ok, sb_msg = supabase_send_reset_email(clean_email)
 
-                # 2. Store reset tracking token
-                if user_record:
-                    raw_token = generate_reset_token()
-                    db_create_reset_token(user_record["username"], user_record["email"], raw_token, valid_minutes=15)
-                    st.session_state["active_reset_token"] = raw_token
-                    st.session_state["active_reset_email"] = user_record["email"]
-                    st.session_state["active_reset_user"] = user_record["username"]
-                else:
-                    st.session_state["active_reset_email"] = clean_email
-                    st.session_state["active_reset_user"] = clean_email
+                    # 2. Store reset tracking token in authoritative database
+                    if user_record:
+                        raw_token = generate_reset_token()
+                        db_create_reset_token(user_record["username"], user_record["email"], raw_token, valid_minutes=15)
+                        st.session_state["active_reset_token"] = raw_token
+                        st.session_state["active_reset_email"] = user_record["email"]
+                        st.session_state["active_reset_user"] = user_record["username"]
+                    else:
+                        st.session_state["active_reset_email"] = clean_email
+                        st.session_state["active_reset_user"] = clean_email
 
-                if sb_ok:
-                    st.success(f"📧 Supabase verification email sent to **{clean_email}**! Please check your inbox.")
-                else:
-                    st.info(f"📧 Password reset initiated for **{clean_email}**.")
-                st.rerun()
+                    if sb_ok:
+                        st.success(f"📧 Supabase verification email sent to **{clean_email}**! Please check your inbox.")
+                    else:
+                        st.info(f"📧 Password reset initiated for **{clean_email}**.")
+                    st.rerun()
+                except DatabaseConnectionError as conn_err:
+                    st.error(f"❌ Database Connection Error: {conn_err}")
+                except Exception as exc:
+                    st.error(f"❌ Request Error: {exc}")
 
         # Active Reset Form with New Password & Confirm Password
         if st.session_state.get("active_reset_email"):
@@ -402,16 +446,21 @@ def login_page():
                         if not is_valid:
                             st.error(f"⚠️ {msg}")
                         else:
-                            new_hash = hash_password(f_new_pwd)
-                            if active_token:
-                                db_reset_password_with_token(active_token, new_hash)
-                            else:
-                                db_update_password(target_user, new_hash)
+                            try:
+                                new_hash = hash_password(f_new_pwd)
+                                if active_token:
+                                    db_reset_password_with_token(active_token, new_hash)
+                                else:
+                                    db_update_password(target_user, new_hash)
 
-                            st.session_state["active_reset_email"] = None
-                            st.session_state["active_reset_token"] = None
-                            st.session_state["reset_tab_completed"] = True
-                            st.rerun()
+                                st.session_state["active_reset_email"] = None
+                                st.session_state["active_reset_token"] = None
+                                st.session_state["reset_tab_completed"] = True
+                                st.rerun()
+                            except DatabaseConnectionError as conn_err:
+                                st.error(f"❌ Database Connection Error: {conn_err}")
+                            except Exception as exc:
+                                st.error(f"❌ Password Reset Error: {exc}")
 
             with col_dismiss:
                 if st.button("Cancel", key="btn_forgot_direct_cancel", use_container_width=True):
@@ -444,22 +493,27 @@ def main_app():
             st.session_state.role = None
             st.rerun()
 
-    # Admin Panel querying SQLite database directly
+    # Admin Panel querying authoritative database
     if user_role == "Admin":
         with st.expander("🛡️ Admin Dashboard: Database Users & System Status"):
-            users_list = db_get_all_users()
-            display_list = [
-                {
-                    "Username": u["username"],
-                    "Email": u["email"],
-                    "Role": u["role"],
-                    "Biometric / FP": "✅ Verified" if u["fingerprint_verified"] else "⚠️ Pending",
-                    "Created At": u.get("created_at", "-")
-                }
-                for u in users_list
-            ]
-            st.dataframe(display_list, use_container_width=True)
-            st.caption(f"Total registered accounts in database: {len(display_list)}")
+            try:
+                users_list = db_get_all_users()
+                display_list = [
+                    {
+                        "Username": u["username"],
+                        "Email": u["email"],
+                        "Role": u["role"],
+                        "Biometric / FP": "✅ Verified" if u["fingerprint_verified"] else "⚠️ Pending",
+                        "Created At": u.get("created_at", "-")
+                    }
+                    for u in users_list
+                ]
+                st.dataframe(display_list, use_container_width=True)
+                st.caption(f"Total registered accounts in authoritative database: {len(display_list)}")
+            except DatabaseConnectionError as conn_err:
+                st.error(f"❌ Database Connection Error: {conn_err}")
+            except Exception as exc:
+                st.error(f"❌ Failed to fetch users: {exc}")
 
     st.write(
         "Upload a **reference signature** and a **test signature** "
